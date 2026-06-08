@@ -1,5 +1,4 @@
 /target
-Cargo.lock
 .env
 /projects/
 # SQLite auth database (and its WAL/SHM sidecar files)
