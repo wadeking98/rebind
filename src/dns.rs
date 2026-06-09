@@ -29,6 +29,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use async_trait::async_trait;
+use rand::seq::SliceRandom;
 use hickory_proto::op::{Header, ResponseCode};
 use hickory_proto::rr::rdata::{A, AAAA};
 use hickory_proto::rr::{RData, Record, RecordType};
@@ -76,7 +77,7 @@ impl RebindHandler {
 
         // Decode the matching addresses out of the name (random/base-domain
         // labels are ignored) and turn them into records.
-        let records: Vec<Record> = decode_addrs(&name, qtype)
+        let mut records: Vec<Record> = decode_addrs(&name, qtype)
             .into_iter()
             .map(|ip| {
                 let rdata = match ip {
@@ -86,6 +87,11 @@ impl RebindHandler {
                 Record::from_rdata(query.name().into(), self.ttl, rdata)
             })
             .collect();
+
+        // Randomize the answer order. Some browsers/resolvers prioritize the
+        // first record returned, so shuffling spreads selection across all
+        // encoded addresses (and helps flip between rebinding targets).
+        records.shuffle(&mut rand::thread_rng());
 
         if !records.is_empty() {
             tracing::info!("answering with {} record(s)", records.len());
