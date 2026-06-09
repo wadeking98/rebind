@@ -28,7 +28,8 @@ project is the per-campaign attack config: **targets**, **stop window**, and the
 
 Deployment/infrastructure settings are **`.env`-only** and not part of any
 project: the listen/bind addresses, `REBIND_DNS_TTL`, `REBIND_SERVER_IP`, ports,
-and the delegated `REBIND_HOSTNAME`. The dashboard shows these read-only.
+the delegated worker domain `REBIND_HOSTNAME`, and the optional separate master
+host `REBIND_MASTER_HOSTNAME`. The dashboard shows these read-only.
 
 - **Dashboard** (`/`): list/open projects, create a new one (targets + stop +
   payload seeded from `.env`), edit, and Save.
@@ -47,12 +48,13 @@ API (used by the dashboard): `GET /api/projects`, `GET /api/defaults`,
 
 ## Rebinding flow
 
-The master page builds one iframe per configured target, each with host
-`<server_ip>.<rebind_ip>.<random>.<hostname>`. **All iframe communication is
-over JS web messages (`postMessage`).**
+The runner page builds one iframe per configured target, each with host
+`<target_ip>.<random>.<REBIND_HOSTNAME>`. **All iframe communication is over JS
+web messages (`postMessage`).**
 
-1. DNS returns **both** `server_ip` and `rebind_ip` as A records. The browser
-   connects to `server_ip` first, so each iframe loads our rebind frame.
+1. DNS decodes `target_ip` from the name and injects our `server_ip` (from
+   config) into the A answer, so the browser sees both addresses and connects to
+   `server_ip` first — each iframe loads our rebind frame.
 2. The master **pings** each iframe. Only our frame page answers with a
    **pong**, so a pong proves the iframe is currently pointing at *our* server.
 3. Any iframe that fails to pong is **reloaded with a fresh random label**,
@@ -60,10 +62,14 @@ over JS web messages (`postMessage`).**
    it points at our server.
 4. Once every iframe has ponged, the master calls `/stop` on `server_ip` and
    sends each iframe an **execute** message.
-5. With `server_ip` refusing connections, the browser fails over to `rebind_ip`
+5. With `server_ip` refusing connections, the browser fails over to `target_ip`
    for the same origin. Each frame's `execute` handler runs the **placeholder
    payload** (`runPayload()` in the frame page) same-origin against the target
    and reports the result back to the master log.
+
+The runner page itself is served by the master and can live on its own domain
+(`REBIND_MASTER_HOSTNAME`), separate from the worker base domain
+(`REBIND_HOSTNAME`) the iframes resolve.
 
 ## Configurable payload
 
@@ -157,7 +163,8 @@ over values in `.env`.
 | `REBIND_DNS_PAD` | `0` | seeds a project's DNS padding — extra `REBIND_SERVER_IP` copies returned alongside the target (the server IP is always included once), max 16; editable per-project under the dashboard's Advanced settings |
 | `REBIND_CONTENT_BIND` | `0.0.0.0:3000` | master server bind (wildcard ⇒ dual-stack IPv4+IPv6) |
 | `REBIND_STANDARD_BIND` | `0.0.0.0:80` | standard-port server bind (wildcard ⇒ dual-stack IPv4+IPv6) |
-| `REBIND_HOSTNAME` | `rebind.example.com` | base domain delegated to the DNS server |
+| `REBIND_HOSTNAME` | `rebind.example.com` | rebind-worker base domain delegated to the DNS server |
+| `REBIND_MASTER_HOSTNAME` | _(unset)_ | public host for the master/runner when separate from the workers; used to build the runner link (else the dashboard origin) |
 | `REBIND_SERVER_IP` | `127.0.0.1` | our IPv4 server IP, injected into A answers as the anchor (tried first) |
 | `REBIND_SERVER_IP6` | _(unset)_ | our IPv6 server IP; AAAA queries return **only** this single address (target never exposed over IPv6). Unset → AAAA NODATA |
 | `REBIND_TARGETS` | `127.0.0.1` | comma-separated target IPs (one iframe each) |

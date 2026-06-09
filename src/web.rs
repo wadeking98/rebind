@@ -68,12 +68,22 @@ async fn allow_framing(req: Request, next: Next) -> Response {
 /// NOT part of a project (they identify where/how this server runs).
 #[derive(Clone)]
 pub struct Deploy {
-    /// Delegated base domain, e.g. `rebind.example.com`.
+    /// Delegated base domain for the rebind workers, e.g. `rebind.example.com`.
+    /// Iframe hosts are built under this; it is what the DNS server is
+    /// authoritative for.
     pub hostname: String,
+    /// Public hostname the master/runner is reached at, when it differs from the
+    /// worker [`Self::hostname`] (e.g. the dashboard is hosted on its own
+    /// domain). Used to build the runner link handed to a target. `None` falls
+    /// back to the operator's current dashboard origin.
+    pub master_hostname: Option<String>,
     /// Public IP of our standard-port server (browsers connect here first).
     pub server_ip: IpAddr,
     /// Real standard-port the server listens on (for iframe URLs / `/stop`).
     pub standard_port: u16,
+    /// Port the master/content server is reached at (for the runner link when
+    /// [`Self::master_hostname`] is set).
+    pub content_port: u16,
 }
 
 /// Cap on how many reports we retain per runner session (oldest dropped past
@@ -248,8 +258,10 @@ async fn api_defaults(State(s): State<MasterState>) -> Json<Project> {
 async fn api_deploy(State(s): State<MasterState>) -> Json<serde_json::Value> {
     Json(json!({
         "hostname": s.deploy.hostname,
+        "master_hostname": s.deploy.master_hostname,
         "server_ip": s.deploy.server_ip.to_string(),
         "standard_port": s.deploy.standard_port,
+        "content_port": s.deploy.content_port,
     }))
 }
 
@@ -763,15 +775,34 @@ async function deleteProject(n) {
   } catch (e) { status(String(e)); }
 }
 
+let deployInfo = null;
+
 async function loadDeploy() {
   const d = await api("GET", "/api/deploy");
+  deployInfo = d;
   const port = d.standard_port === 80 ? "" : ":" + d.standard_port;
-  $("deploy").innerHTML =
-    "hostname: <code></code><br>server IP: <code></code><br>standard port: <code></code>";
+  let html = "worker hostname: <code></code><br>server IP: <code></code>" +
+             "<br>standard port: <code></code>";
+  if (d.master_hostname) html += "<br>master hostname: <code></code>";
+  $("deploy").innerHTML = html;
   const codes = $("deploy").querySelectorAll("code");
   codes[0].textContent = d.hostname;
   codes[1].textContent = d.server_ip;
   codes[2].textContent = d.standard_port + port;
+  if (d.master_hostname) codes[3].textContent = d.master_hostname;
+}
+
+// Build the runner link to hand to a target. When a master hostname is
+// configured we point at it (keeping the dashboard's scheme and the master's
+// port); otherwise we use the operator's current dashboard origin.
+function runnerLink(relUrl) {
+  if (deployInfo && deployInfo.master_hostname) {
+    const p = deployInfo.content_port;
+    const def = location.protocol === "https:" ? 443 : 80;
+    const portSuffix = p && p !== def ? ":" + p : "";
+    return location.protocol + "//" + deployInfo.master_hostname + portSuffix + relUrl;
+  }
+  return location.origin + relUrl;
 }
 
 let scopedRid = null;
@@ -861,7 +892,7 @@ async function refreshRunners() {
 async function activateRunner() {
   try {
     const r = await api("POST", "/api/runner");
-    const url = location.origin + r.url;
+    const url = runnerLink(r.url);
     $("runnerlink").innerHTML = "Runner link (send to target):<br><code></code>";
     $("runnerlink").querySelector("code").textContent = url;
     await refreshRunners();
