@@ -13,7 +13,7 @@
 //!   standing in for the `::` zero-run, e.g. `2001-db8-z-1` → `2001:db8::1`,
 //!   or the fully expanded `2001-db8-0-0-0-0-0-1`.
 //!
-//! Multiple records are returned by stacking labels, e.g.
+//! Multiple records can be stacked by repeating labels, e.g.
 //! `192-168-1-1.10-0-0-1.rebind.example.com` resolves (for a type-A query) to
 //! both `192.168.1.1` and `10.0.0.1`. Labels that don't parse as an IP (the
 //! base domain, decorative labels, etc.) are ignored, so the scheme works
@@ -21,10 +21,20 @@
 //!
 //! Because non-IP labels are skipped, a client can insert a **random label to
 //! defeat DNS caching** and force a fresh resolution each time, e.g.
-//! `<IP>.<IP>.<random>.example.com` such as
-//! `192-168-1-1.10-0-0-1.k3f9zq.example.com`. The `k3f9zq` label simply
-//! doesn't parse as an IP and is ignored, while the addresses are still
-//! returned.
+//! `<target>.<random>.example.com` such as
+//! `192-168-1-1.k3f9zq.example.com`. The `k3f9zq` label simply doesn't parse
+//! as an IP and is ignored, while the address is still returned.
+//!
+//! # Server-IP injection
+//!
+//! The rebind name only needs to carry the **target** IP. Our own server's IP
+//! is known from config (`REBIND_SERVER_IP`), so the handler injects it into
+//! every answer that decoded a target (see [`answer_addrs`]): the server IP is
+//! always added once — the anchor the victim's browser lands on first — plus a
+//! configurable number of extra copies to bias browsers that prioritize the
+//! first record. `/stop` then takes the server offline and the browser fails
+//! over to the target. (Encoding the server IP in the name as a second label
+//! still works, but is no longer required.)
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -199,20 +209,26 @@ fn decode_addrs(name: &str, qtype: RecordType) -> Vec<IpAddr> {
     out
 }
 
-/// Build the full set of addresses to answer with: the targets decoded from
-/// `name`, plus `pad` extra copies of `server_ip`. Padding is only applied when
-/// at least one target was decoded and `server_ip` matches the query type
-/// (A→IPv4, AAAA→IPv6); the caller is expected to shuffle the result so the
-/// padding interleaves with the target rather than grouping at the end.
+/// Build the full set of addresses to answer with: the target(s) decoded from
+/// `name`, plus copies of our own `server_ip`. The rebind name only carries the
+/// target IP — the server IP is known from config and injected here, so the
+/// browser lands on our server first and only fails over to the target once
+/// `/stop` takes us offline.
+///
+/// When at least one target was decoded and `server_ip` matches the query type
+/// (A→IPv4, AAAA→IPv6), the server IP is always added once (the rebind anchor),
+/// plus `pad` extra copies to bias browsers that prioritize whichever record
+/// comes first. The caller shuffles the result so the copies interleave with
+/// the target rather than grouping at the end.
 fn answer_addrs(name: &str, qtype: RecordType, server_ip: IpAddr, pad: usize) -> Vec<IpAddr> {
     let mut addrs = decode_addrs(name, qtype);
-    if !addrs.is_empty() && pad > 0 {
+    if !addrs.is_empty() {
         let server_matches = matches!(
             (server_ip, qtype),
             (IpAddr::V4(_), RecordType::A) | (IpAddr::V6(_), RecordType::AAAA)
         );
         if server_matches {
-            addrs.extend(std::iter::repeat(server_ip).take(pad));
+            addrs.extend(std::iter::repeat(server_ip).take(pad + 1));
         }
     }
     addrs
@@ -333,30 +349,33 @@ mod tests {
     }
 
     #[test]
-    fn pads_with_server_ip() {
+    fn injects_server_ip_alongside_target() {
         let server: IpAddr = "203.0.113.5".parse().unwrap();
         let target = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+        // The rebind name carries only the target; the server IP comes from
+        // config.
         let name = "192-168-1-1.k3f9zq.example.com.";
 
-        // pad=3 → target + 3 copies of the server IP, in decode/append order
-        // (the handler shuffles afterwards).
+        // pad=3 → target + the anchor server IP + 3 extra copies = 4 servers,
+        // in decode/append order (the handler shuffles afterwards).
         let out = answer_addrs(name, RecordType::A, server, 3);
-        assert_eq!(out, vec![target, server, server, server]);
-        assert_eq!(out.iter().filter(|ip| **ip == server).count(), 3);
+        assert_eq!(out, vec![target, server, server, server, server]);
+        assert_eq!(out.iter().filter(|ip| **ip == server).count(), 4);
 
-        // pad=0 → no padding, just the decoded target(s).
-        assert_eq!(answer_addrs(name, RecordType::A, server, 0), vec![target]);
+        // pad=0 → the server IP is still injected once (the rebind anchor).
+        assert_eq!(answer_addrs(name, RecordType::A, server, 0), vec![target, server]);
     }
 
     #[test]
-    fn no_pad_without_target_or_on_type_mismatch() {
+    fn no_injection_without_target_or_on_type_mismatch() {
         let server_v4: IpAddr = "203.0.113.5".parse().unwrap();
 
-        // No decoded target → nothing to anchor padding to → empty answer.
+        // No decoded target → nothing to rebind → empty answer (the server IP
+        // is only injected alongside a target).
         assert!(answer_addrs("example.com.", RecordType::A, server_v4, 3).is_empty());
 
-        // IPv4 server IP must not pad an AAAA answer (type mismatch); the IPv6
-        // target is still returned alone.
+        // IPv4 server IP can't anchor an AAAA answer (type mismatch); the IPv6
+        // target is returned alone.
         let name = "2001-db8-z-1.example.com.";
         assert_eq!(
             answer_addrs(name, RecordType::AAAA, server_v4, 3),

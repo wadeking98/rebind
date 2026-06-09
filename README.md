@@ -111,6 +111,18 @@ Stack labels to return multiple records:
 Labels that don't parse as an IP (base domain, etc.) are ignored. A queries
 return only IPv4 records; AAAA queries return only IPv6 records.
 
+A rebind name only needs to carry the **target** IP — the server's own IP is
+known from config (`REBIND_SERVER_IP`) and injected into every answer that
+decoded a target, so the runner emits `<target>.<random>.rebind.example.com`:
+
+```
+192-168-1-1.k3f9zq.rebind.example.com   ->  A 192.168.1.1 + A <server IP>×(1+pad)
+```
+
+The server IP is always added once (the anchor the browser lands on first),
+plus `REBIND_DNS_PAD` extra copies; `/stop` then fails the browser over to the
+target. The whole answer is returned in randomized order.
+
 ## Build & run
 
 ```sh
@@ -137,7 +149,7 @@ over values in `.env`.
 |----------|---------|---------|
 | `REBIND_DNS_BIND` | `0.0.0.0:53` | DNS UDP bind address |
 | `REBIND_DNS_TTL` | `0` | TTL on answers (0 = no caching) |
-| `REBIND_DNS_PAD` | `3` | seeds a project's DNS padding (extra `REBIND_SERVER_IP` copies per answer, max 16, 0 = off); editable per-project under the dashboard's Advanced settings |
+| `REBIND_DNS_PAD` | `3` | seeds a project's DNS padding — extra `REBIND_SERVER_IP` copies returned alongside the target (the server IP is always included once), max 16; editable per-project under the dashboard's Advanced settings |
 | `REBIND_CONTENT_BIND` | `0.0.0.0:3000` | master server bind |
 | `REBIND_STANDARD_BIND` | `0.0.0.0:80` | standard-port server bind |
 | `REBIND_HOSTNAME` | `rebind.example.com` | base domain delegated to the DNS server |
