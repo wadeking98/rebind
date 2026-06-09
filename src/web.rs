@@ -985,13 +985,13 @@ async fn frame_page(State(state): State<Arc<AppState>>) -> Html<String> {
 }
 
 /// Built-in fallback payload, used when no payload file is configured/readable.
-/// It reads the rebound target's root and reports status, length and a sample.
-/// Configure your own via `REBIND_PAYLOAD_FILE` (see `payload.js`).
+/// It reads the rebound target's root and reports status, length and the full
+/// body. Configure your own via `REBIND_PAYLOAD_FILE` (see `payload.js`).
 pub const DEFAULT_PAYLOAD: &str = r#"// Default placeholder payload.
 async function runPayload(rebind) {
   const res = await fetch("/", { cache: "no-store" });
   const body = await res.text();
-  rebind.report({ status: res.status, length: body.length, sample: body.slice(0, 200) });
+  rebind.report({ status: res.status, length: body.length, body });
 }
 "#;
 

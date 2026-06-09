@@ -9,7 +9,7 @@
 // Returning a rejected promise / throwing is also reported as an error.
 //
 // This default reads the target's root and a couple of common paths, reporting
-// status + a sample of each. Replace the body with your own logic.
+// status + the full body of each. Replace the body with your own logic.
 
 async function runPayload(rebind) {
   const paths = ["/", "/api", "/admin"];
@@ -23,7 +23,7 @@ async function runPayload(rebind) {
         path,
         status: res.status,
         length: body.length,
-        sample: body.slice(0, 200),
+        body, // full response body — the master renders it untruncated
       });
     } catch (e) {
       findings.push({ path, error: String(e) });
