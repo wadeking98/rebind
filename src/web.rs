@@ -205,6 +205,8 @@ struct ProjectBody {
     #[serde(default)]
     stop_seconds: u64,
     #[serde(default)]
+    pad: usize,
+    #[serde(default)]
     payload: String,
 }
 
@@ -239,6 +241,7 @@ async fn api_save(
         name,
         targets: body.targets,
         stop_seconds: body.stop_seconds.min(20),
+        pad: body.pad.min(project::MAX_PAD),
         payload: body.payload,
     };
     project::save(&project).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -611,6 +614,8 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
   textarea, input.wide { width: 100%; box-sizing: border-box; }
   button { cursor: pointer; }
   label { display: block; margin: .5rem 0; }
+  #advanced { margin: .5rem 0; border:1px solid #ddd; border-radius:6px; padding:.25rem .75rem; background:#fafafa; }
+  #advanced summary { cursor:pointer; font-weight:600; padding:.25rem 0; }
   #deploy { background:#f4f4f4; border-radius:6px; padding:.5rem .75rem; font-size:13px; }
   #deploy code { color:#333; }
   #status { background:#111; color:#0f0; padding:.5rem; border-radius:6px; min-height:1.5rem; white-space:pre-wrap; }
@@ -646,8 +651,13 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       <label>Name <input id="name" class="wide" placeholder="project-name"></label>
       <label>Targets <small>(comma-separated IPs &mdash; one iframe each)</small>
         <input id="targets" class="wide" placeholder="10.0.0.5, 10.0.0.6"></label>
-      <label>Stop seconds <small>(max 20)</small>
-        <input id="stop" type="number" min="0" max="20"></label>
+      <details id="advanced">
+        <summary>Advanced settings</summary>
+        <label>Stop seconds <small>(max 20)</small>
+          <input id="stop" type="number" min="0" max="20"></label>
+        <label>DNS padding <small>(extra server-IP records returned per answer, max 16; 0 = off)</small>
+          <input id="pad" type="number" min="0" max="16"></label>
+      </details>
       <label>Payload &mdash; <code>async function runPayload(rebind)</code>
         <textarea id="payload" rows="16"></textarea></label>
       <p>
@@ -691,6 +701,7 @@ function readForm() {
     name: $("name").value.trim(),
     targets,
     stop_seconds: Math.min(20, parseInt($("stop").value, 10) || 0),
+    pad: Math.min(16, Math.max(0, parseInt($("pad").value, 10) || 0)),
     payload: $("payload").value,
   };
 }
@@ -699,6 +710,7 @@ function fillForm(p) {
   $("name").value = p.name || "";
   $("targets").value = (p.targets || []).join(", ");
   $("stop").value = p.stop_seconds ?? 5;
+  $("pad").value = p.pad ?? 3;
   $("payload").value = p.payload || "";
 }
 
@@ -863,7 +875,7 @@ async function save() {
   if (!p.name) { status("Please set a project name (letters, digits, - and _ only)."); return; }
   try {
     const saved = await api("POST", "/api/project/" + encodeURIComponent(p.name),
-                            { targets: p.targets, stop_seconds: p.stop_seconds, payload: p.payload });
+                            { targets: p.targets, stop_seconds: p.stop_seconds, pad: p.pad, payload: p.payload });
     await refreshProjects();
     $("activename").textContent = saved.name;
     status("Saved & activated: " + saved.name);

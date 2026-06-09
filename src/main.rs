@@ -13,6 +13,8 @@
 //! Configuration is via environment variables (all optional):
 //!   REBIND_DNS_BIND       default 0.0.0.0:53
 //!   REBIND_DNS_TTL        default 0
+//!   REBIND_DNS_PAD        default 3   (seeds a project's DNS padding count;
+//!                                      editable per-project from the dashboard)
 //!   REBIND_CONTENT_BIND   default 0.0.0.0:3000
 //!   REBIND_STANDARD_BIND  default 0.0.0.0:80
 //!   REBIND_HOSTNAME       default rebind.example.com   (base domain we serve)
@@ -119,8 +121,9 @@ async fn main() {
     tracing::info!("  server   -> {server_ip}:{standard_port}");
     tracing::info!("  projects -> {}", project::projects_dir().display());
 
+    let dns_active = active.clone();
     let dns_task = tokio::spawn(async move {
-        if let Err(e) = dns::serve(&dns_bind, dns_ttl).await {
+        if let Err(e) = dns::serve(&dns_bind, dns_ttl, server_ip, dns_active).await {
             tracing::error!("dns fatal: {e}");
             tracing::error!("(port 53 needs privileges; try REBIND_DNS_BIND=0.0.0.0:5353)");
         }

