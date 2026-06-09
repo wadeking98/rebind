@@ -154,9 +154,9 @@ over values in `.env`.
 |----------|---------|---------|
 | `REBIND_DNS_BIND` | `0.0.0.0:53` | DNS UDP bind address |
 | `REBIND_DNS_TTL` | `0` | TTL on answers (0 = no caching) |
-| `REBIND_DNS_PAD` | `3` | seeds a project's DNS padding — extra `REBIND_SERVER_IP` copies returned alongside the target (the server IP is always included once), max 16; editable per-project under the dashboard's Advanced settings |
-| `REBIND_CONTENT_BIND` | `0.0.0.0:3000` | master server bind |
-| `REBIND_STANDARD_BIND` | `0.0.0.0:80` | standard-port server bind |
+| `REBIND_DNS_PAD` | `0` | seeds a project's DNS padding — extra `REBIND_SERVER_IP` copies returned alongside the target (the server IP is always included once), max 16; editable per-project under the dashboard's Advanced settings |
+| `REBIND_CONTENT_BIND` | `0.0.0.0:3000` | master server bind (wildcard ⇒ dual-stack IPv4+IPv6) |
+| `REBIND_STANDARD_BIND` | `0.0.0.0:80` | standard-port server bind (wildcard ⇒ dual-stack IPv4+IPv6) |
 | `REBIND_HOSTNAME` | `rebind.example.com` | base domain delegated to the DNS server |
 | `REBIND_SERVER_IP` | `127.0.0.1` | our IPv4 server IP, injected into A answers as the anchor (tried first) |
 | `REBIND_SERVER_IP6` | _(unset)_ | our IPv6 server IP; AAAA queries return **only** this single address (target never exposed over IPv6). Unset → AAAA NODATA |
@@ -168,10 +168,10 @@ over values in `.env`.
 ```sh
 # A query: the target is decoded from the name and this server's IP
 # (REBIND_SERVER_IP) is injected as the anchor + REBIND_DNS_PAD extra copies,
-# all in randomized order. With the defaults (server 127.0.0.1, pad 3):
+# all in randomized order. With the defaults (server 127.0.0.1, pad 0):
 dig @127.0.0.1 -p 5353 192-168-1-1.k3f9zq.rebind.test A +short
 # -> 192.168.1.1
-#    127.0.0.1      (x4, shuffled)
+#    127.0.0.1      (+ REBIND_DNS_PAD extra copies, shuffled)
 
 # AAAA returns ONLY REBIND_SERVER_IP6 (here 2001:db8::1) — never the target:
 dig @127.0.0.1 -p 5353 192-168-1-1.k3f9zq.rebind.test AAAA +short

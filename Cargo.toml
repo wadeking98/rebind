@@ -23,6 +23,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 argon2 = "0.5"
 rand = "0.8"
 base64 = "0.22"
+socket2 = "0.5"
 
 [profile.release]
 opt-level = 3

@@ -40,7 +40,7 @@ fn default_stop_seconds() -> u64 {
 }
 
 fn default_pad() -> usize {
-    3
+    0
 }
 
 /// Cap on DNS padding, to keep an answer from overflowing a UDP DNS packet.

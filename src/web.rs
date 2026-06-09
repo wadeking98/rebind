@@ -18,7 +18,7 @@
 //! disturb a link already handed out. The dashboard logs results per report ID.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -32,6 +32,7 @@ use axum::Router;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 
@@ -141,6 +142,32 @@ struct MasterState {
     sessions: Sessions,
 }
 
+/// Bind a TCP listener for `bind`, serving both IPv4 and IPv6 on the same port.
+///
+/// When `bind` is a wildcard address (`0.0.0.0:p` or `[::]:p`), we bind a single
+/// dual-stack IPv6 socket (`[::]:p` with `IPV6_V6ONLY` disabled) so the server
+/// answers on both families — needed because a victim resolving the rebind name
+/// over AAAA connects to us over IPv6. A specific (non-wildcard) address is bound
+/// as-is on its own family, and anything that doesn't parse as a socket address
+/// (e.g. a `host:port`) falls back to tokio's resolver.
+async fn bind_listener(bind: &str) -> std::io::Result<TcpListener> {
+    let addr: SocketAddr = match bind.parse() {
+        Ok(a) => a,
+        Err(_) => return TcpListener::bind(bind).await,
+    };
+    if !addr.ip().is_unspecified() {
+        return TcpListener::bind(addr).await;
+    }
+    let dual = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), addr.port());
+    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_only_v6(false)?; // accept IPv4 (as v4-mapped) and IPv6
+    socket.set_reuse_address(true)?; // allow quick rebind after a /stop pause
+    socket.bind(&dual.into())?;
+    socket.listen(1024)?;
+    socket.set_nonblocking(true)?;
+    TcpListener::from_std(socket.into())
+}
+
 /// Serve the dashboard + runner + project API on `bind` (default `:3000`).
 pub async fn serve_content(
     bind: &str,
@@ -190,7 +217,7 @@ pub async fn serve_content(
         .layer(from_fn(allow_framing))
         .with_state(state);
 
-    let listener = TcpListener::bind(bind).await?;
+    let listener = bind_listener(bind).await?;
     tracing::info!("content listening on http://{bind} (dashboard / ; runner /run?rid=…)");
     axum::serve(listener, app).await?;
     Ok(())
@@ -708,7 +735,7 @@ function fillForm(p) {
   $("name").value = p.name || "";
   $("targets").value = (p.targets || []).join(", ");
   $("stop").value = p.stop_seconds ?? 5;
-  $("pad").value = p.pad ?? 3;
+  $("pad").value = p.pad ?? 0;
   $("payload").value = p.payload || "";
 }
 
@@ -929,7 +956,7 @@ pub async fn serve_standard(bind: &str, active: Active) -> Result<(), Box<dyn st
     });
 
     loop {
-        let listener = match TcpListener::bind(bind).await {
+        let listener = match bind_listener(bind).await {
             Ok(l) => l,
             Err(e) => {
                 tracing::warn!("bind {bind} failed: {e}; retrying in 1s");

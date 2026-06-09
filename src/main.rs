@@ -13,7 +13,7 @@
 //! Configuration is via environment variables (all optional):
 //!   REBIND_DNS_BIND       default 0.0.0.0:53
 //!   REBIND_DNS_TTL        default 0
-//!   REBIND_DNS_PAD        default 3   (seeds a project's DNS padding count;
+//!   REBIND_DNS_PAD        default 0   (seeds a project's DNS padding count;
 //!                                      editable per-project from the dashboard)
 //!   REBIND_CONTENT_BIND   default 0.0.0.0:3000
 //!   REBIND_STANDARD_BIND  default 0.0.0.0:80
