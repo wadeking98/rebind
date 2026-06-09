@@ -29,7 +29,7 @@ project is the per-campaign attack config: **targets**, **stop window**, and the
 Deployment/infrastructure settings are **`.env`-only** and not part of any
 project: the listen/bind addresses, `REBIND_DNS_TTL`, `REBIND_SERVER_IP`, ports,
 the delegated worker domain `REBIND_HOSTNAME`, and the optional separate master
-host `REBIND_MASTER_HOSTNAME`. The dashboard shows these read-only.
+base URL `REBIND_MASTER_URL`. The dashboard shows these read-only.
 
 - **Dashboard** (`/`): list/open projects, create a new one (targets + stop +
   payload seeded from `.env`), edit, and Save.
@@ -67,9 +67,9 @@ web messages (`postMessage`).**
    payload** (`runPayload()` in the frame page) same-origin against the target
    and reports the result back to the master log.
 
-The runner page itself is served by the master and can live on its own domain
-(`REBIND_MASTER_HOSTNAME`), separate from the worker base domain
-(`REBIND_HOSTNAME`) the iframes resolve.
+The runner page itself is served by the master and can live at its own base URL
+(`REBIND_MASTER_URL`, TLS-terminating proxy fine), separate from the worker base
+domain (`REBIND_HOSTNAME`) the iframes resolve.
 
 ## Configurable payload
 
@@ -164,7 +164,7 @@ over values in `.env`.
 | `REBIND_CONTENT_BIND` | `0.0.0.0:3000` | master server bind (wildcard ⇒ dual-stack IPv4+IPv6) |
 | `REBIND_STANDARD_BIND` | `0.0.0.0:80` | standard-port server bind (wildcard ⇒ dual-stack IPv4+IPv6) |
 | `REBIND_HOSTNAME` | `rebind.example.com` | rebind-worker base domain delegated to the DNS server |
-| `REBIND_MASTER_HOSTNAME` | _(unset)_ | public host for the master/runner when separate from the workers; used to build the runner link (else the dashboard origin) |
+| `REBIND_MASTER_URL` | _(unset)_ | public base URL (scheme+host+port, TLS ok) for the master/runner when separate from the workers; used to build the runner link (else the dashboard origin) |
 | `REBIND_SERVER_IP` | `127.0.0.1` | our IPv4 server IP, injected into A answers as the anchor (tried first) |
 | `REBIND_SERVER_IP6` | _(unset)_ | our IPv6 server IP; AAAA queries return **only** this single address (target never exposed over IPv6). Unset → AAAA NODATA |
 | `REBIND_TARGETS` | `127.0.0.1` | comma-separated target IPs (one iframe each) |

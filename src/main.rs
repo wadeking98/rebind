@@ -18,7 +18,7 @@
 //!   REBIND_CONTENT_BIND   default 0.0.0.0:3000
 //!   REBIND_STANDARD_BIND  default 0.0.0.0:80
 //!   REBIND_HOSTNAME       default rebind.example.com   (rebind-worker base domain)
-//!   REBIND_MASTER_HOSTNAME unset                       (master/runner host, if separate)
+//!   REBIND_MASTER_URL     unset                        (master/runner base URL, if separate)
 //!   REBIND_SERVER_IP      default 127.0.0.1            (our IPv4 server IP; A anchor)
 //!   REBIND_SERVER_IP6     unset                        (our IPv6 server IP; sole AAAA answer)
 //!   REBIND_TARGETS        default 127.0.0.1            (comma-separated targets)
@@ -73,17 +73,19 @@ async fn main() {
     let standard_bind = env_or("REBIND_STANDARD_BIND", "0.0.0.0:80");
 
     let standard_port = port_of(&standard_bind, 80);
-    let content_port = port_of(&content_bind, 3000);
 
     // Deployment settings — environment / .env only, not part of any project.
     let hostname = env_or("REBIND_HOSTNAME", "rebind.example.com");
-    // Optional public hostname for the master/runner when it lives on a domain
-    // separate from the rebind workers. Unset -> the dashboard origin is used
-    // when building runner links.
-    let master_hostname = std::env::var("REBIND_MASTER_HOSTNAME")
+    // Optional public base URL for the master/runner when it lives somewhere
+    // separate from the rebind workers (e.g. its own domain, possibly behind a
+    // TLS reverse proxy). Used as-is to build runner links, so it carries the
+    // scheme/host/port. A bare host (no scheme) defaults to https. Unset -> the
+    // operator's current dashboard origin is used.
+    let master_url = std::env::var("REBIND_MASTER_URL")
         .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .map(|s| if s.contains("://") { s } else { format!("https://{s}") });
     let server_ip: IpAddr = env_or("REBIND_SERVER_IP", "127.0.0.1")
         .parse()
         .expect("REBIND_SERVER_IP must be a valid IP address");
@@ -128,10 +130,9 @@ async fn main() {
 
     let deploy = Deploy {
         hostname: hostname.clone(),
-        master_hostname: master_hostname.clone(),
+        master_url: master_url.clone(),
         server_ip,
         standard_port,
-        content_port,
     };
 
     tracing::info!("rebind starting");
@@ -139,9 +140,9 @@ async fn main() {
     tracing::info!("  content  -> {content_bind} (dashboard / ; runner /run)");
     tracing::info!("  standard -> {standard_bind}");
     tracing::info!("  hostname -> {hostname} (rebind workers)");
-    match &master_hostname {
-        Some(h) => tracing::info!("  master   -> {h}:{content_port} (runner links)"),
-        None => tracing::info!("  master   -> (dashboard origin; set REBIND_MASTER_HOSTNAME to override)"),
+    match &master_url {
+        Some(u) => tracing::info!("  master   -> {u} (runner links)"),
+        None => tracing::info!("  master   -> (dashboard origin; set REBIND_MASTER_URL to override)"),
     }
     tracing::info!("  server   -> {server_ip}:{standard_port}");
     match server_ip6 {
