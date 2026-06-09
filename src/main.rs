@@ -18,7 +18,8 @@
 //!   REBIND_CONTENT_BIND   default 0.0.0.0:3000
 //!   REBIND_STANDARD_BIND  default 0.0.0.0:80
 //!   REBIND_HOSTNAME       default rebind.example.com   (base domain we serve)
-//!   REBIND_SERVER_IP      default 127.0.0.1            (our standard server IP)
+//!   REBIND_SERVER_IP      default 127.0.0.1            (our IPv4 server IP; A anchor)
+//!   REBIND_SERVER_IP6     unset                        (our IPv6 server IP; sole AAAA answer)
 //!   REBIND_TARGETS        default 127.0.0.1            (comma-separated targets)
 //!   REBIND_STOP_SECONDS   default 30                   (offline window on /stop)
 //!   REBIND_AUTH_DB        default rebind-auth.db       (master Basic-auth DB)
@@ -31,7 +32,7 @@ mod dns;
 mod project;
 mod web;
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::{Arc, RwLock};
 
 use project::Project;
@@ -77,6 +78,15 @@ async fn main() {
     let server_ip: IpAddr = env_or("REBIND_SERVER_IP", "127.0.0.1")
         .parse()
         .expect("REBIND_SERVER_IP must be a valid IP address");
+    // Optional IPv6 address returned as the sole answer to AAAA queries (the
+    // target is never exposed over IPv6). Unset -> AAAA queries get NODATA.
+    let server_ip6: Option<Ipv6Addr> = match std::env::var("REBIND_SERVER_IP6") {
+        Ok(s) => Some(
+            s.parse()
+                .expect("REBIND_SERVER_IP6 must be a valid IPv6 address"),
+        ),
+        Err(_) => None,
+    };
 
     // Load the configurable payload (JS defining `runPayload(rebind)`); fall
     // back to the built-in default when no file is set or it can't be read.
@@ -119,11 +129,15 @@ async fn main() {
     tracing::info!("  standard -> {standard_bind}");
     tracing::info!("  hostname -> {hostname}");
     tracing::info!("  server   -> {server_ip}:{standard_port}");
+    match server_ip6 {
+        Some(ip6) => tracing::info!("  server6  -> {ip6} (sole AAAA answer)"),
+        None => tracing::info!("  server6  -> (unset; AAAA -> NODATA)"),
+    }
     tracing::info!("  projects -> {}", project::projects_dir().display());
 
     let dns_active = active.clone();
     let dns_task = tokio::spawn(async move {
-        if let Err(e) = dns::serve(&dns_bind, dns_ttl, server_ip, dns_active).await {
+        if let Err(e) = dns::serve(&dns_bind, dns_ttl, server_ip, server_ip6, dns_active).await {
             tracing::error!("dns fatal: {e}");
             tracing::error!("(port 53 needs privileges; try REBIND_DNS_BIND=0.0.0.0:5353)");
         }

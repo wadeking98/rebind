@@ -108,11 +108,10 @@ Stack labels to return multiple records:
 192-168-1-1.10-0-0-1.rebind.example.com   ->  A 192.168.1.1 + A 10.0.0.1
 ```
 
-Labels that don't parse as an IP (base domain, etc.) are ignored. A queries
-return only IPv4 records; AAAA queries return only IPv6 records.
+Labels that don't parse as an IP (base domain, etc.) are ignored.
 
 A rebind name only needs to carry the **target** IP — the server's own IP is
-known from config (`REBIND_SERVER_IP`) and injected into every answer that
+known from config (`REBIND_SERVER_IP`) and injected into every A answer that
 decoded a target, so the runner emits `<target>.<random>.rebind.example.com`:
 
 ```
@@ -122,6 +121,12 @@ decoded a target, so the runner emits `<target>.<random>.rebind.example.com`:
 The server IP is always added once (the anchor the browser lands on first),
 plus `REBIND_DNS_PAD` extra copies; `/stop` then fails the browser over to the
 target. The whole answer is returned in randomized order.
+
+**AAAA queries** are handled separately: they return **only** the configured
+`REBIND_SERVER_IP6` (a single record), never the target. This keeps the rebind
+on the v4 path we control — a dual-stack browser can't reach the target over
+IPv6 and skip the `/stop` timing. With `REBIND_SERVER_IP6` unset, AAAA is empty
+(NODATA).
 
 ## Build & run
 
@@ -153,19 +158,23 @@ over values in `.env`.
 | `REBIND_CONTENT_BIND` | `0.0.0.0:3000` | master server bind |
 | `REBIND_STANDARD_BIND` | `0.0.0.0:80` | standard-port server bind |
 | `REBIND_HOSTNAME` | `rebind.example.com` | base domain delegated to the DNS server |
-| `REBIND_SERVER_IP` | `127.0.0.1` | our standard server's IP (tried first) |
+| `REBIND_SERVER_IP` | `127.0.0.1` | our IPv4 server IP, injected into A answers as the anchor (tried first) |
+| `REBIND_SERVER_IP6` | _(unset)_ | our IPv6 server IP; AAAA queries return **only** this single address (target never exposed over IPv6). Unset → AAAA NODATA |
 | `REBIND_TARGETS` | `127.0.0.1` | comma-separated target IPs (one iframe each) |
 | `REBIND_STOP_SECONDS` | `30` | offline window the master requests on `/stop` |
 
 ## Quick test
 
 ```sh
-# Query the DNS server (using high port example):
-dig @127.0.0.1 -p 5353 192-168-1-1.10-0-0-1.rebind.test A +short
+# A query: the target is decoded from the name and this server's IP
+# (REBIND_SERVER_IP) is injected as the anchor + REBIND_DNS_PAD extra copies,
+# all in randomized order. With the defaults (server 127.0.0.1, pad 3):
+dig @127.0.0.1 -p 5353 192-168-1-1.k3f9zq.rebind.test A +short
 # -> 192.168.1.1
-#    10.0.0.1
+#    127.0.0.1      (x4, shuffled)
 
-dig @127.0.0.1 -p 5353 2001-db8-z-1.rebind.test AAAA +short
+# AAAA returns ONLY REBIND_SERVER_IP6 (here 2001:db8::1) — never the target:
+dig @127.0.0.1 -p 5353 192-168-1-1.k3f9zq.rebind.test AAAA +short
 # -> 2001:db8::1
 
 # Pause the standard-port server for 15 seconds:
