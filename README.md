@@ -161,8 +161,8 @@ over values in `.env`.
 | `REBIND_DNS_BIND` | `0.0.0.0:53` | DNS UDP bind address |
 | `REBIND_DNS_TTL` | `0` | TTL on answers (0 = no caching) |
 | `REBIND_DNS_PAD` | `0` | seeds a project's DNS padding — extra `REBIND_SERVER_IP` copies returned alongside the target (the server IP is always included once), max 16; editable per-project under the dashboard's Advanced settings |
-| `REBIND_CONTENT_BIND` | `0.0.0.0:3000` | master server bind (wildcard ⇒ dual-stack IPv4+IPv6) |
-| `REBIND_STANDARD_BIND` | `0.0.0.0:80` | standard-port server bind (wildcard ⇒ dual-stack IPv4+IPv6) |
+| `REBIND_CONTENT_BIND` | `0.0.0.0:3000` | master server bind (single family; IPv4 only by default) |
+| `REBIND_STANDARD_BIND` | `0.0.0.0:80` | standard-port (JS payload) server bind; wildcard ⇒ dual-stack IPv4+IPv6, or a comma-separated list to bind several addresses (e.g. `10.0.2.210:80,[fd00::210]:80`) — same port each, public port from the first entry |
 | `REBIND_HOSTNAME` | `rebind.example.com` | rebind-worker base domain delegated to the DNS server |
 | `REBIND_MASTER_URL` | _(unset)_ | public base URL (scheme+host+port, TLS ok) for the master/runner when separate from the workers; used to build the runner link (else the dashboard origin) |
 | `REBIND_SERVER_IP` | `127.0.0.1` | our IPv4 server IP, injected into A answers as the anchor (tried first) |

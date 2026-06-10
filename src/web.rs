@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::TcpListener;
-use tokio::sync::Notify;
+use tokio::sync::watch;
 
 use crate::auth::{self, AuthDb};
 use crate::dns::ip_to_label;
@@ -225,7 +225,9 @@ pub async fn serve_content(
         .layer(from_fn(allow_framing))
         .with_state(state);
 
-    let listener = bind_listener(bind).await?;
+    // The operator-facing master binds exactly as configured (single family;
+    // IPv4 by default) — typically pinned to a private management IP.
+    let listener = TcpListener::bind(bind).await?;
     tracing::info!("content listening on http://{bind} (dashboard / ; runner /run?rid=…)");
     axum::serve(listener, app).await?;
     Ok(())
@@ -963,50 +965,82 @@ init();
 
 /// Shared state for the standard-port server.
 struct AppState {
-    /// Fired by `/stop` to trigger graceful shutdown of the current listener.
-    notify: Notify,
+    /// Bumped by `/stop` to trigger graceful shutdown of every current listener.
+    /// A `watch` (rather than a `Notify`) so all listeners are woken race-free,
+    /// even those that subscribe slightly after a stop fires.
+    shutdown: watch::Sender<u64>,
     /// How many seconds the server should stay down after the next stop.
     seconds: AtomicU64,
     /// Active project (used to render the frame payload per request).
     active: Active,
 }
 
-/// Serve on a standard port (`bind`, default `0.0.0.0:80`). Serves the rebind
-/// frame (with the active project's payload) and the `/stop` control endpoint.
-pub async fn serve_standard(bind: &str, active: Active) -> Result<(), Box<dyn std::error::Error>> {
+/// Serve the rebind frame (with the active project's payload) and the `/stop`
+/// control endpoint. `binds` is a comma-separated list of addresses (default
+/// `0.0.0.0:80`); one listener is bound per entry, so the server can be reached
+/// on several IPs/families at once — e.g. a private IPv4 plus a specific IPv6.
+/// All entries should use the same port (the runner builds a single port into
+/// its URLs). A wildcard entry (`0.0.0.0:p`/`[::]:p`) binds dual-stack.
+pub async fn serve_standard(binds: &str, active: Active) -> Result<(), Box<dyn std::error::Error>> {
+    let (shutdown, _) = watch::channel(0u64);
     let state = Arc::new(AppState {
-        notify: Notify::new(),
+        shutdown,
         seconds: AtomicU64::new(DEFAULT_STOP_SECONDS),
         active,
     });
 
+    let addrs: Vec<String> = binds
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
     loop {
-        let listener = match bind_listener(bind).await {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::warn!("bind {bind} failed: {e}; retrying in 1s");
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                continue;
+        // The JS-payload server is what a victim reaches, including over IPv6
+        // when it resolves the rebind name via AAAA. Bind every configured
+        // address; a wildcard entry goes dual-stack (IPv4 + IPv6 on one port).
+        let mut listeners = Vec::new();
+        for a in &addrs {
+            match bind_listener(a).await {
+                Ok(l) => listeners.push((a.clone(), l)),
+                Err(e) => tracing::warn!("bind {a} failed: {e}"),
             }
-        };
+        }
+        if listeners.is_empty() {
+            tracing::warn!("no standard listeners bound (of: {binds}); retrying in 1s");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
 
-        let app = Router::new()
-            .route("/stop", get(stop_handler))
-            .fallback(get(frame_page))
-            .layer(from_fn(allow_framing))
-            .with_state(state.clone());
-
-        tracing::info!("standard listening on http://{bind} (control: GET /stop[?seconds=N])");
-
-        let shutdown_state = state.clone();
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                shutdown_state.notify.notified().await;
-            })
-            .await?;
+        // Serve each listener concurrently; all shut down together on /stop.
+        let mut set = tokio::task::JoinSet::new();
+        for (a, listener) in listeners {
+            let app = Router::new()
+                .route("/stop", get(stop_handler))
+                .fallback(get(frame_page))
+                .layer(from_fn(allow_framing))
+                .with_state(state.clone());
+            // Mark the current generation as seen so `changed()` waits for the
+            // NEXT stop rather than returning immediately.
+            let mut rx = state.shutdown.subscribe();
+            rx.borrow_and_update();
+            tracing::info!("standard listening on http://{a} (control: GET /stop[?seconds=N])");
+            set.spawn(async move {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        let _ = rx.changed().await;
+                    })
+                    .await
+            });
+        }
+        while let Some(res) = set.join_next().await {
+            if let Ok(Err(e)) = res {
+                tracing::warn!("standard listener error: {e}");
+            }
+        }
 
         let secs = state.seconds.load(Ordering::SeqCst);
-        tracing::info!("standard paused; port {bind} closed for {secs}s");
+        tracing::info!("standard paused; closed for {secs}s");
         tokio::time::sleep(Duration::from_secs(secs)).await;
         tracing::info!("standard resuming");
     }
@@ -1023,7 +1057,8 @@ async fn stop_handler(
         .min(MAX_STOP_SECONDS);
 
     state.seconds.store(secs, Ordering::SeqCst);
-    state.notify.notify_one();
+    // Bump the generation to wake every listener's graceful-shutdown future.
+    state.shutdown.send_modify(|g| *g = g.wrapping_add(1));
     tracing::info!("/stop -> pausing for {secs}s");
 
     Json(json!({ "status": "stopping", "seconds": secs }))

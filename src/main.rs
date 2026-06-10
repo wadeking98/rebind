@@ -72,7 +72,10 @@ async fn main() {
     let content_bind = env_or("REBIND_CONTENT_BIND", "0.0.0.0:3000");
     let standard_bind = env_or("REBIND_STANDARD_BIND", "0.0.0.0:80");
 
-    let standard_port = port_of(&standard_bind, 80);
+    // REBIND_STANDARD_BIND may be a comma-separated list; the public port (used
+    // in runner/iframe URLs and /stop) comes from the first entry. All entries
+    // are expected to share the same port.
+    let standard_port = port_of(standard_bind.split(',').next().unwrap_or(&standard_bind), 80);
 
     // Deployment settings — environment / .env only, not part of any project.
     let hostname = env_or("REBIND_HOSTNAME", "rebind.example.com");
