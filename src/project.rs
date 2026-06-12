@@ -33,6 +33,13 @@ pub struct Project {
     /// JS payload defining `runPayload(rebind)`.
     #[serde(default)]
     pub payload: String,
+    /// HTML document served as the runner page (the page hosting the rebind
+    /// iframes). Two placeholders are substituted at render time:
+    /// `{{REBIND_SCRIPT}}` (the orchestration `<script>`, always injected — if
+    /// absent it is appended before `</body>`) and `{{PROJECT_NAME}}`. Empty
+    /// falls back to [`DEFAULT_RUNNER_HTML`].
+    #[serde(default)]
+    pub runner_html: String,
 }
 
 fn default_stop_seconds() -> u64 {
@@ -42,6 +49,46 @@ fn default_stop_seconds() -> u64 {
 fn default_pad() -> usize {
     0
 }
+
+/// Placeholder in [`Project::runner_html`] replaced by the orchestration script.
+pub const RUNNER_SCRIPT_MARKER: &str = "{{REBIND_SCRIPT}}";
+
+/// Placeholder in [`Project::runner_html`] replaced by the (escaped) project name.
+pub const RUNNER_NAME_MARKER: &str = "{{PROJECT_NAME}}";
+
+/// Default runner page. The visible markup here is fully editable per-project;
+/// only the `{{REBIND_SCRIPT}}` block (the rebinding logic) is injected by the
+/// server. Custom pages may drop the `#frames`/`#log` elements — the injected
+/// script creates a hidden frames container if one is missing, so the rebind
+/// still runs behind arbitrary decoy content.
+pub const DEFAULT_RUNNER_HTML: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>rebind :: runner</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 1.5rem; }
+  #log { white-space: pre-wrap; font-family: monospace; background:#111; color:#0f0;
+          padding:1rem; border-radius:6px; min-height:8rem; }
+  iframe { width: 360px; height: 70px; border: 1px solid #ccc; margin: 4px; }
+  .frame-label { font-family: monospace; font-size: 12px; color:#555; }
+  a { color:#06c; }
+</style>
+</head>
+<body>
+  <h1>rebind runner &mdash; project: {{PROJECT_NAME}}</h1>
+  <p>One iframe per target. Each loads
+     <code>&lt;target_ip&gt;.&lt;random&gt;.&lt;hostname&gt;</code>; the DNS server adds
+     this server's IP to the answer (from config), so the browser lands here
+     first. The master pings each frame; frames that don't pong are reloaded
+     with a fresh random label until they point at this server.</p>
+  <div id="frames"></div>
+  <h2>Log</h2>
+  <div id="log"></div>
+{{REBIND_SCRIPT}}
+</body>
+</html>
+"#;
 
 /// Cap on DNS padding, to keep an answer from overflowing a UDP DNS packet.
 pub const MAX_PAD: usize = 16;
@@ -75,6 +122,17 @@ impl Project {
             stop_seconds,
             pad,
             payload: payload.to_string(),
+            runner_html: String::new(),
+        }
+    }
+
+    /// The runner page HTML, falling back to [`DEFAULT_RUNNER_HTML`] when the
+    /// project hasn't customized it.
+    pub fn runner_html_or_default(&self) -> &str {
+        if self.runner_html.trim().is_empty() {
+            DEFAULT_RUNNER_HTML
+        } else {
+            &self.runner_html
         }
     }
 

